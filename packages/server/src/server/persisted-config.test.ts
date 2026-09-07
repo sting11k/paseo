@@ -69,6 +69,18 @@ describe("PersistedConfigSchema daemon browser tools config", () => {
   });
 });
 
+describe("PersistedConfigSchema daemon MCP config", () => {
+  test("accepts an empty provider injection allowlist", () => {
+    const parsed = PersistedConfigSchema.parse({
+      daemon: {
+        mcp: { injectIntoAgents: true, injectIntoProviders: [] },
+      },
+    });
+
+    expect(parsed.daemon?.mcp?.injectIntoProviders).toEqual([]);
+  });
+});
+
 describe("PersistedConfigSchema daemon relay config", () => {
   test("accepts optional relay TLS setting", () => {
     const parsed = PersistedConfigSchema.parse({

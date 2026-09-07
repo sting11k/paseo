@@ -96,6 +96,8 @@ export interface CreateAgentFromMcpInput {
   unattended?: boolean;
   promptFailure?: CreateAgentPromptFailureMode;
   notifyOnFinish: boolean;
+  /** "always" keeps notifying the caller for every later turn of the child. */
+  notifyMode?: "once" | "always";
   internal?: boolean;
   detached?: boolean;
   owner?: AgentOwner;
@@ -207,6 +209,7 @@ export async function createAgentCommand(
           childAgentId: snapshot.id,
           callerAgentId: input.callerAgentId,
           requireParentOwnership: true,
+          persistent: input.notifyMode === undefined ? undefined : input.notifyMode === "always",
           logger: dependencies.logger,
         })
       : undefined;

@@ -69,6 +69,9 @@ import {
   toScheduleSummary,
 } from "../mcp-shared.js";
 import {
+  applyNotifyOnFinishLabelChange,
+  callerAcceptsFinishNotifications,
+  NOTIFY_ON_FINISH_LABEL,
   type PromptDispatchDisposition,
   sendPromptToAgent,
   setupFinishNotification,
@@ -1133,6 +1136,12 @@ function createToolCatalog(
       .trim()
       .min(1, "initialPrompt is required")
       .describe("Required first task to run immediately after creation."),
+    notifyMode: z
+      .enum(["once", "always"])
+      .optional()
+      .describe(
+        "With notifyOnFinish: 'once' (default) notifies until the agent's next finish; 'always' keeps notifying for every later turn and permission request until the agent is archived or its paseo.notify-on-finish label is cleared.",
+      ),
   };
   const legacyCreateAgentPlacementFields = {
     relationship: AgentRelationshipInputSchema.describe(
@@ -1238,6 +1247,12 @@ function createToolCatalog(
     agentId: z.string(),
     prompt: z.string(),
     sessionMode: z.string().optional().describe("Optional mode to set before running the prompt."),
+    notifyMode: z
+      .enum(["once", "always"])
+      .optional()
+      .describe(
+        "With notifyOnFinish: 'once' (default) notifies until the agent's next finish; 'always' keeps notifying for every later turn and permission request until the agent is archived or its paseo.notify-on-finish label is cleared.",
+      ),
   };
   const agentToAgentSendAgentPromptInputSchema = {
     ...commonSendAgentPromptInputSchema,
@@ -1567,6 +1582,9 @@ function createToolCatalog(
       } else {
         notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
       }
+      if (callerAgentId && !callerAcceptsFinishNotifications({ agentManager, callerAgentId })) {
+        notifyOnFinish = false;
+      }
       const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
       const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
       const { snapshot, initialPromptStarted } = await createAgentCommand(
@@ -1597,6 +1615,7 @@ function createToolCatalog(
           mode: parsedArgs.settings?.modeId,
           promptFailure: "throw",
           notifyOnFinish,
+          notifyMode: parsedArgs.notifyMode,
           detached: resolvedArgs.detached,
           callerAgentId,
           callerContext,
@@ -1990,6 +2009,7 @@ function createToolCatalog(
       prompt,
       sessionMode,
       notifyOnFinish = Boolean(callerAgentId),
+      notifyMode,
       activeTurnBehavior = callerAgentId ? "steer" : "interrupt",
     }) => {
       let stopNotification: (() => void) | undefined;
@@ -1997,8 +2017,14 @@ function createToolCatalog(
       const dispatchResult = new Promise<PromptDispatchDisposition | false>((resolve) => {
         acceptDispatch = resolve;
       });
-      const notifying = Boolean(callerAgentId && notifyOnFinish);
-      if (callerAgentId && notifyOnFinish) {
+      const acceptsNotifications = Boolean(
+        callerAgentId && callerAcceptsFinishNotifications({ agentManager, callerAgentId }),
+      );
+      const notifying = Boolean(callerAgentId && notifyOnFinish && acceptsNotifications);
+      // Undefined inherits an existing subscription's persistence, so a
+      // plain follow-up prompt cannot downgrade an "always" watch.
+      const persistent = notifyMode === undefined ? undefined : notifyMode === "always";
+      if (callerAgentId && notifying) {
         stopNotification = setupFinishNotification({
           agentManager,
           agentStorage,
@@ -2006,6 +2032,7 @@ function createToolCatalog(
           callerAgentId,
           waitForTurnStart: false,
           dispatchResult,
+          persistent,
           logger: childLogger,
         });
       }
@@ -2017,7 +2044,7 @@ function createToolCatalog(
           return;
         }
         acceptDispatch(disposition);
-        if (!callerAgentId || !notifyOnFinish) return;
+        if (!callerAgentId || !notifying) return;
         stopNotification?.();
         stopNotification = setupFinishNotification({
           agentManager,
@@ -2025,6 +2052,7 @@ function createToolCatalog(
           childAgentId: agentId,
           callerAgentId,
           waitForTurnStart: true,
+          persistent,
           logger: childLogger,
         });
       }
@@ -2302,6 +2330,15 @@ function createToolCatalog(
       }
 
       await updateAgentCommand({ agentManager }, { agentId, name, labels });
+
+      if (labels && NOTIFY_ON_FINISH_LABEL in labels) {
+        await applyNotifyOnFinishLabelChange({
+          agentManager,
+          agentStorage,
+          childAgentId: agentId,
+          logger: childLogger,
+        });
+      }
 
       return {
         content: [],

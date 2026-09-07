@@ -406,6 +406,19 @@ export interface SetupFinishNotificationParams {
   dispatchResult?: Promise<PromptDispatchDisposition | false>;
   /** A replacement must observe its new start, not the displaced running snapshot. */
   waitForTurnStart?: boolean;
+  /**
+   * When true the subscription survives the child's finishes and errors: the
+   * caller is woken for every later turn until the child closes or the
+   * notify-on-finish label is cleared. When undefined, an existing
+   * subscription for the same (child, caller) keeps its persistence;
+   * otherwise defaults to false (one finish, then done).
+   */
+  persistent?: boolean;
+  /**
+   * Allow subscribing to a child that has no live session yet (boot resume,
+   * label edits). The subscription waits for the child to load and run.
+   */
+  allowUnloaded?: boolean;
   logger: Logger;
 }
 
@@ -414,7 +427,9 @@ type FinishNotificationReason =
   | "errored"
   | "needs permission"
   | "was closed"
-  | "was canceled";
+  | "was canceled"
+  | "was interrupted by a daemon restart"
+  | "ended before a daemon restart could deliver its notification";
 
 const finishNotificationEvents = {
   finished: "finished",
@@ -423,6 +438,8 @@ const finishNotificationEvents = {
   "was closed": "closed",
   // Use the existing failure event so older clients still parse agent-message metadata.
   "was canceled": "errored",
+  "was interrupted by a daemon restart": "errored",
+  "ended before a daemon restart could deliver its notification": "finished",
 } as const;
 
 const FINISH_NOTIFICATION_MESSAGE_LIMIT = 4000;
@@ -480,6 +497,156 @@ const armedFinishNotifications = new WeakMap<
   Map<string, Set<ArmedFinishNotification>>
 >();
 
+type FinishNotificationPolicyReader = Pick<
+  AgentManager,
+  "getAgent" | "resolveProviderPaseoToolPolicy"
+>;
+
+/**
+ * Whether the caller's provider takes finish notifications at all. Observer
+ * seats (paseoTools.finishNotifications: false) watch agents through status
+ * polling, so a prompt they send must not wake them on every later turn.
+ * `callerProvider` covers callers that are not loaded (boot catch-up).
+ */
+export function callerAcceptsFinishNotifications(params: {
+  agentManager: FinishNotificationPolicyReader;
+  callerAgentId: string;
+  callerProvider?: string | null;
+}): boolean {
+  const provider =
+    params.agentManager.getAgent(params.callerAgentId)?.provider ?? params.callerProvider;
+  if (!provider) return true;
+  return (
+    params.agentManager.resolveProviderPaseoToolPolicy(provider)?.finishNotifications !== false
+  );
+}
+
+/**
+ * Persisted opt-in for finish notifications, stored on the child record so
+ * subscriptions survive daemon restarts. Value is `once` or `always`,
+ * optionally suffixed with the caller id (`always:<agentId>`). Without a
+ * caller suffix the parent from `paseo.parent-agent-id` is notified.
+ */
+export const NOTIFY_ON_FINISH_LABEL = "paseo.notify-on-finish";
+
+export interface ParsedNotifyOnFinishLabel {
+  mode: "once" | "always";
+  callerAgentId: string | null;
+}
+
+export function parseNotifyOnFinishLabel(
+  labels: Record<string, unknown> | null | undefined,
+): ParsedNotifyOnFinishLabel | null {
+  const raw = labels?.[NOTIFY_ON_FINISH_LABEL];
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "off" || trimmed === "false" || trimmed === "0") return null;
+  const separator = trimmed.indexOf(":");
+  const mode = separator === -1 ? trimmed : trimmed.slice(0, separator);
+  const caller = separator === -1 ? "" : trimmed.slice(separator + 1).trim();
+  return {
+    mode: mode === "always" ? "always" : "once",
+    callerAgentId: caller.length > 0 ? caller : null,
+  };
+}
+
+// Serialize label writes per child so a setup-time write can never land after
+// (and resurrect) a terminal clear.
+const notifyLabelWriteChains = new Map<string, Promise<void>>();
+
+interface PersistNotifyOnFinishLabelParams {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  childAgentId: string;
+  value: string | null;
+  /**
+   * When clearing (`value: null`), only clear if the label still holds this
+   * value. The label is a single slot per child, so a retiring subscription
+   * must not wipe a value a newer subscription has written since.
+   */
+  expectedValue?: string;
+  logger: Logger;
+}
+
+/**
+ * Best-effort label write; a failure must never break notification delivery.
+ * Live agents go through the manager so the in-memory snapshot stays in sync;
+ * unloaded agents are patched directly in storage. Clearing writes "" on the
+ * live path (setLabels cannot delete) — the parser treats "" as absent.
+ * Unchanged values are skipped so routine re-subscribes cost no write.
+ */
+async function persistNotifyOnFinishLabel(params: PersistNotifyOnFinishLabelParams): Promise<void> {
+  const previous = notifyLabelWriteChains.get(params.childAgentId) ?? Promise.resolve();
+  const write = previous.then(() => doPersistNotifyOnFinishLabel(params));
+  notifyLabelWriteChains.set(params.childAgentId, write);
+  await write;
+  if (notifyLabelWriteChains.get(params.childAgentId) === write) {
+    notifyLabelWriteChains.delete(params.childAgentId);
+  }
+}
+
+async function doPersistNotifyOnFinishLabel(
+  params: PersistNotifyOnFinishLabelParams,
+): Promise<void> {
+  try {
+    const liveAgent = params.agentManager.getAgent(params.childAgentId);
+    const record = liveAgent ? null : await params.agentStorage.get(params.childAgentId);
+    if (!liveAgent && !record) return;
+    const current = (liveAgent ? liveAgent.labels : record?.labels)?.[NOTIFY_ON_FINISH_LABEL] ?? "";
+
+    if (params.value === null) {
+      if (current === "") return;
+      if (params.expectedValue !== undefined && current !== params.expectedValue) return;
+    } else if (current === params.value) {
+      return;
+    }
+
+    if (liveAgent) {
+      await params.agentManager.setLabels(params.childAgentId, {
+        [NOTIFY_ON_FINISH_LABEL]: params.value ?? "",
+      });
+      return;
+    }
+    if (!record) return;
+    const labels = { ...record.labels };
+    if (params.value === null) {
+      delete labels[NOTIFY_ON_FINISH_LABEL];
+    } else {
+      labels[NOTIFY_ON_FINISH_LABEL] = params.value;
+    }
+    await params.agentStorage.upsert({ ...record, labels });
+  } catch (error) {
+    params.logger.warn(
+      { err: error, childAgentId: params.childAgentId },
+      "Failed to persist notify-on-finish label",
+    );
+  }
+}
+
+interface FinishSubscriptionEntry {
+  stop(): void;
+  persistent: boolean;
+}
+
+// Live subscriptions by (child, caller), for persistence inheritance across
+// re-subscribes and label-driven teardown. Delivery arming stays in
+// armedFinishNotifications; this registry never stops a pending dispatch.
+const activeFinishSubscriptions = new WeakMap<AgentManager, Map<string, FinishSubscriptionEntry>>();
+
+function finishSubscriptionKey(childAgentId: string, callerAgentId: string): string {
+  return `${childAgentId}\u0000${callerAgentId}`;
+}
+
+// An unspecified mode inherits the replaced subscription's persistence: a
+// routine follow-up prompt must not silently downgrade an "always" watch.
+function resolveSubscriptionPersistence(
+  registry: Map<string, FinishSubscriptionEntry>,
+  subscriptionKey: string,
+  requested: boolean | undefined,
+): boolean {
+  return requested ?? registry.get(subscriptionKey)?.persistent ?? false;
+}
+
 export function setupFinishNotification(params: SetupFinishNotificationParams): () => void {
   const {
     agentManager,
@@ -488,14 +655,33 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     callerAgentId,
     requireParentOwnership = false,
     waitForTurnStart = false,
+    allowUnloaded = false,
     logger,
   } = params;
+  if (!callerAcceptsFinishNotifications({ agentManager, callerAgentId })) {
+    logger.debug(
+      { childAgentId, callerAgentId },
+      "Caller provider declines finish notifications; not subscribing",
+    );
+    return () => {};
+  }
   let hasSeenRunning = false;
   let hasSeenTurn = false;
   let stopped = false;
   const notifiedPermissionRequestIds = new Set<string>();
   let unsubscribe: (() => void) | null = null;
   let notificationQueue = Promise.resolve();
+
+  const subscriptionRegistry =
+    activeFinishSubscriptions.get(agentManager) ?? new Map<string, FinishSubscriptionEntry>();
+  activeFinishSubscriptions.set(agentManager, subscriptionRegistry);
+  const subscriptionKey = finishSubscriptionKey(childAgentId, callerAgentId);
+  const persistent = resolveSubscriptionPersistence(
+    subscriptionRegistry,
+    subscriptionKey,
+    params.persistent,
+  );
+  const persistedLabelValue = `${persistent ? "always" : "once"}:${callerAgentId}`;
 
   const armedByManager = armedFinishNotifications.get(agentManager) ?? new Map();
   armedFinishNotifications.set(agentManager, armedByManager);
@@ -537,6 +723,9 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
   function stop(): void {
     stopped = true;
     unsubscribe?.();
+    if (subscriptionRegistry.get(subscriptionKey)?.stop === stop) {
+      subscriptionRegistry.delete(subscriptionKey);
+    }
     // Pending observations remain visible to overlapping sends until acknowledgement.
     if (!dispatchPending) {
       registrations.delete(registration);
@@ -544,6 +733,39 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
         armedByManager.delete(armedKey);
       }
     }
+  }
+
+  function clearPersistedLabel(): void {
+    void persistNotifyOnFinishLabel({
+      agentManager,
+      agentStorage,
+      childAgentId,
+      value: null,
+      expectedValue: persistedLabelValue,
+      logger,
+    });
+  }
+
+  function writePersistedLabel(): void {
+    void persistNotifyOnFinishLabel({
+      agentManager,
+      agentStorage,
+      childAgentId,
+      value: persistedLabelValue,
+      logger,
+    });
+  }
+
+  subscriptionRegistry.set(subscriptionKey, { stop, persistent });
+  // A subscription that may still be rejected at dispatch must not persist
+  // until the dispatch is accepted, or boot resume would resurrect it.
+  if (params.dispatchResult) {
+    void params.dispatchResult.then((accepted) => {
+      if (accepted && !stopped) writePersistedLabel();
+      return undefined;
+    });
+  } else {
+    writePersistedLabel();
   }
 
   async function notify(
@@ -557,6 +779,27 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     if (await superseded) return;
     const callerRecord = await agentStorage.get(callerAgentId);
     if (callerRecord?.archivedAt) {
+      logger.warn(
+        { childAgentId, callerAgentId, reason, cause: "archived" },
+        "Abandoned caller agent notification",
+      );
+      // The caller will never receive this, so the persisted subscription is
+      // dead weight; retire it here rather than on delivery.
+      stop();
+      clearPersistedLabel();
+      return;
+    }
+    // A subscription restored before the caller was loaded, or created before
+    // its provider opted out, ends here instead of waking the caller.
+    if (
+      !callerAcceptsFinishNotifications({
+        agentManager,
+        callerAgentId,
+        callerProvider: callerRecord?.provider,
+      })
+    ) {
+      stop();
+      clearPersistedLabel();
       return;
     }
 
@@ -565,7 +808,13 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       return;
     }
     const title = record?.title ?? childAgentId;
-    const lastAssistantMessage = await agentManager.getLastAssistantMessage(childAgentId);
+    let lastAssistantMessage: string | null = null;
+    try {
+      lastAssistantMessage = await agentManager.getLastAssistantMessage(childAgentId);
+    } catch {
+      // A closed/unloaded child may have no readable timeline; the status
+      // line alone must still reach the caller.
+    }
     const body = formatFinishNotificationBody({
       childAgentId,
       title,
@@ -592,9 +841,17 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
 
   function notifySafely(reason: FinishNotificationReason, options: NotifySafelyOptions = {}): void {
     if (stopped) return;
-    if (options.terminal ?? true) stop();
+    const terminal = options.terminal ?? true;
+    // A terminal event ends the subscription immediately, but the persisted
+    // label is retired only when the notification is delivered — a daemon
+    // restart in between must still find it and report the miss.
+    if (terminal) stop();
     notificationQueue = notificationQueue
-      .then(() => notify(reason, options.permissionRequest))
+      .then(async () => {
+        await notify(reason, options.permissionRequest);
+        if (terminal) clearPersistedLabel();
+        return undefined;
+      })
       .catch((error) => {
         logger.error(
           { err: error, childAgentId, callerAgentId, reason },
@@ -620,7 +877,8 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     // Prior terminal state is not this task's outcome. A failure before turn start
     // is reported by the dispatch acknowledgement instead of a finish callback.
     if (agent.lifecycle === "error" && hasSeenTurn) {
-      notifySafely("errored");
+      notifySafely("errored", { terminal: !persistent });
+      hasSeenRunning = false;
       return;
     }
     // Idle is published before the terminal stream event for both completion
@@ -658,9 +916,11 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
         // cancellation. The task settles only when the child becomes idle.
         if (agentManager.getAgent(childAgentId)?.lifecycle !== "idle") return;
         if (event.event.type === "turn_completed" && hasSeenRunning) {
-          notifySafely("finished");
+          notifySafely("finished", { terminal: !persistent });
+          hasSeenRunning = false;
         } else if (event.event.type === "turn_canceled" && hasSeenTurn) {
-          notifySafely("was canceled");
+          notifySafely("was canceled", { terminal: !persistent });
+          hasSeenRunning = false;
         }
         return;
       }
@@ -697,8 +957,16 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
   // not have started yet (streamAgent sets a pending run before
   // transitioning to "running").
   const childSnapshot = agentManager.getAgent(childAgentId);
-  if (!childSnapshot || childSnapshot.lifecycle === "closed") {
+  if (!childSnapshot) {
+    if (!allowUnloaded) {
+      stop();
+      clearPersistedLabel();
+    }
+    return stop;
+  }
+  if (childSnapshot.lifecycle === "closed") {
     stop();
+    clearPersistedLabel();
     return stop;
   }
   if (childSnapshot.lifecycle === "running" && !waitForTurnStart) {
@@ -706,4 +974,176 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     hasSeenRunning = true;
   }
   return stop;
+}
+
+/** Stop every live finish subscription watching a child (label cleared/edited). */
+function stopFinishSubscriptionsForChild(agentManager: AgentManager, childAgentId: string): void {
+  const registry = activeFinishSubscriptions.get(agentManager);
+  if (!registry) return;
+  const prefix = `${childAgentId}\u0000`;
+  const stops: Array<() => void> = [];
+  for (const [key, entry] of registry) {
+    if (key.startsWith(prefix)) stops.push(entry.stop);
+  }
+  for (const stop of stops) stop();
+}
+
+/**
+ * Re-apply a child's notify-on-finish label after it was edited (update_agent).
+ * Establishes, replaces, or tears down the live subscription to match.
+ */
+export async function applyNotifyOnFinishLabelChange(params: {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  childAgentId: string;
+  logger: Logger;
+}): Promise<void> {
+  const { agentManager, agentStorage, childAgentId, logger } = params;
+  const record = await agentStorage.get(childAgentId);
+  if (!record) return;
+  // Tear down every existing watcher first: the label is one slot per child,
+  // so a caller change must not leave the previous caller's watcher running.
+  stopFinishSubscriptionsForChild(agentManager, childAgentId);
+  const parsed = parseNotifyOnFinishLabel(record.labels);
+  if (!parsed) return;
+  const callerAgentId = parsed.callerAgentId ?? getParentAgentIdFromLabels(record.labels);
+  if (!callerAgentId) {
+    logger.warn(
+      { childAgentId, label: NOTIFY_ON_FINISH_LABEL },
+      "notify-on-finish label has no caller and the agent has no parent; ignoring",
+    );
+    return;
+  }
+  setupFinishNotification({
+    agentManager,
+    agentStorage,
+    childAgentId,
+    callerAgentId,
+    persistent: parsed.mode === "always",
+    // A parent-derived caller keeps the ownership guard create_agent applies,
+    // so a detached/re-parented child stops notifying its ex-parent.
+    requireParentOwnership: getParentAgentIdFromLabels(record.labels) === callerAgentId,
+    allowUnloaded: true,
+    logger,
+  });
+}
+
+/**
+ * Rebuild finish-notification subscriptions from persisted labels after a
+ * daemon restart. Runs killed by the restart are reported to their caller as
+ * interrupted; one-shot subscriptions end there (the watched run is gone),
+ * while `always` subscriptions are re-established.
+ */
+export async function resumeFinishNotificationsOnBoot(params: {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  logger: Logger;
+}): Promise<void> {
+  const { agentManager, agentStorage, logger } = params;
+  const records = await agentStorage.list();
+  // Records are independent; catch-up timeline reads must not serialize boot.
+  await Promise.all(
+    records.map(async (record) => {
+      if (record.archivedAt) return;
+      const parsed = parseNotifyOnFinishLabel(record.labels);
+      if (!parsed) return;
+      const callerAgentId = parsed.callerAgentId ?? getParentAgentIdFromLabels(record.labels);
+      if (!callerAgentId) return;
+      const wasRunning = record.lastStatus === "running";
+
+      if (parsed.mode === "always") {
+        setupFinishNotification({
+          agentManager,
+          agentStorage,
+          childAgentId: record.id,
+          callerAgentId,
+          persistent: true,
+          requireParentOwnership: getParentAgentIdFromLabels(record.labels) === callerAgentId,
+          allowUnloaded: true,
+          logger,
+        });
+        // Only a run that was still in flight at shutdown warrants a catch-up;
+        // the subscription itself covers everything after.
+        if (!wasRunning) return;
+      }
+
+      // A one-shot watched run cannot have survived the restart. Mid-flight
+      // runs were killed by it; anything else ended with the notification
+      // undelivered — without knowing how, so the wording must not claim a
+      // completion the run may never have reached. Delivery retires the label.
+      const reason: FinishNotificationReason = wasRunning
+        ? "was interrupted by a daemon restart"
+        : "ended before a daemon restart could deliver its notification";
+      const callerRecord = await agentStorage.get(callerAgentId);
+      if (callerRecord?.archivedAt) {
+        if (parsed.mode === "once") {
+          void persistNotifyOnFinishLabel({
+            agentManager,
+            agentStorage,
+            childAgentId: record.id,
+            value: null,
+            logger,
+          });
+        }
+        return;
+      }
+      if (
+        !callerAcceptsFinishNotifications({
+          agentManager,
+          callerAgentId,
+          callerProvider: callerRecord?.provider,
+        })
+      ) {
+        void persistNotifyOnFinishLabel({
+          agentManager,
+          agentStorage,
+          childAgentId: record.id,
+          value: null,
+          logger,
+        });
+        return;
+      }
+      let lastAssistantMessage: string | null = null;
+      try {
+        lastAssistantMessage = await agentManager.getLastAssistantMessage(record.id);
+      } catch {
+        // Timeline may be unreadable for an unloaded agent; the status line alone is enough.
+      }
+      try {
+        await sendPromptToAgent({
+          agentManager,
+          agentStorage,
+          agentId: callerAgentId,
+          prompt: formatFinishNotificationBody({
+            childAgentId: record.id,
+            title: record.title ?? record.id,
+            reason,
+            lastAssistantMessage,
+          }),
+          source: {
+            kind: "agent-notification",
+            agentId: record.id,
+            event: finishNotificationEvents[reason],
+          },
+          activeTurnBehavior: "steer",
+          unarchive: false,
+          logger,
+        });
+        if (parsed.mode === "once") {
+          void persistNotifyOnFinishLabel({
+            agentManager,
+            agentStorage,
+            childAgentId: record.id,
+            value: null,
+            logger,
+          });
+        }
+      } catch (error) {
+        logger.error(
+          { err: error, childAgentId: record.id, callerAgentId, reason },
+          "Failed to deliver restart catch-up notification",
+        );
+      }
+    }),
+  );
 }

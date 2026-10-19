@@ -33,6 +33,8 @@ interface KnownReport {
 export interface AgentUsageLookup {
   hasAgent(id: string): boolean;
   usageSession(id: string): AgentUsageSession | null;
+  /** Configured launch environments the host discovers alongside its own before any agent runs. */
+  usageLaunches?(): Array<Omit<AgentUsageSession, "sessionKey">>;
 }
 
 export interface ListUsageReportsOptions {
@@ -54,6 +56,7 @@ export class UsageSourceRegistry {
   private readonly sources = new Map<string, UsageSource>();
   private readonly known = new Map<string, KnownReport>();
   private defaults = new Map<string, KnownReport>();
+  private launched?: { at: number; key: string; reports: Map<string, KnownReport> };
   private readonly byAgent = new Map<string, AgentReports>();
   private readonly cache = new Map<string, { at: number; entry: UsageReportEntry }>();
   private readonly successful = new Map<string, NonNullable<UsageReportEntry["lastSuccessful"]>>();
@@ -70,10 +73,12 @@ export class UsageSourceRegistry {
   register(source: UsageSource): void {
     if (this.sources.has(source.id)) throw new Error(`Duplicate usage source: ${source.id}`);
     this.sources.set(source.id, source);
+    this.launched = undefined;
   }
 
   unregister(id: string): void {
     this.sources.delete(id);
+    this.launched = undefined;
     for (const key of this.defaults.keys()) if (key.startsWith(`${id}:`)) this.defaults.delete(key);
     // Re-discover on the next session query when a source is replaced.
     for (const [agentId, mapping] of this.byAgent) {
@@ -99,7 +104,7 @@ export class UsageSourceRegistry {
     } else if (options.reportIds !== undefined) {
       ids = options.reportIds;
     } else {
-      this.defaults = await this.discover({ kind: "global" }, this.defaults);
+      this.defaults = await this.discoverHost(options.forceRefresh);
       this.mergeKnown();
       ids = [...this.known.keys()];
     }
@@ -156,24 +161,52 @@ export class UsageSourceRegistry {
     return [...reports.keys()];
   }
 
+  /** The daemon's own logins first, then those of configured launch environments. */
+  private async discoverHost(forceRefresh = false): Promise<Map<string, KnownReport>> {
+    const [host, launched] = await Promise.all([
+      this.discover({ kind: "global" }, this.defaults),
+      this.discoverLaunches(forceRefresh),
+    ]);
+    const merged = new Map<string, KnownReport>();
+    for (const reports of [host, launched]) addReports(merged, reports);
+    return merged;
+  }
+
+  /**
+   * Configured launches change only with provider config, so their discovery is reused for the
+   * fetch TTL unless forced; each launch runs every source's discovery.
+   */
+  private async discoverLaunches(forceRefresh: boolean): Promise<Map<string, KnownReport>> {
+    const launches = new Map(
+      (this.agents.usageLaunches?.() ?? []).map((launch) => [canonicalJson(launch), launch]),
+    );
+    const key = [...launches.keys()].sort().join("\n");
+    const previous = this.launched;
+    if (!forceRefresh && previous?.key === key && this.now() - previous.at < this.ttlMs)
+      return previous.reports;
+    const discovered = await Promise.all(
+      [...launches.values()].map((launch) =>
+        this.discover({ kind: "session", ...launch }, previous?.reports),
+      ),
+    );
+    const reports = new Map<string, KnownReport>();
+    for (const launchReports of discovered) addReports(reports, launchReports);
+    this.launched = { at: this.now(), key, reports };
+    return reports;
+  }
+
   private mergeKnown(): void {
     this.known.clear();
     for (const reports of [
       this.defaults,
       ...[...this.byAgent.values()].map((agent) => agent.reports),
     ]) {
-      for (const [id, report] of reports) {
-        if (this.sources.get(report.source.id) !== report.source) continue;
-        const known = this.known.get(id);
-        if (!known) {
-          this.known.set(id, { ...report, logins: [...report.logins] });
-          continue;
-        }
-        for (const login of report.logins) {
-          if (!known.logins.some((existing) => loginKey(existing) === loginKey(login)))
-            known.logins.push(login);
-        }
-      }
+      addReports(
+        this.known,
+        new Map(
+          [...reports].filter(([, report]) => this.sources.get(report.source.id) === report.source),
+        ),
+      );
     }
     // Fetch freshness expires independently of successful snapshots. Retain only live identities.
     const active = this.activeCacheKeys();
@@ -384,13 +417,35 @@ function legacyError(report: UsageReport, now: number): string | null {
   return null;
 }
 
+/** Adds each report to target, appending logins it does not already hold in discovery order. */
+function addReports(
+  target: Map<string, KnownReport>,
+  reports: ReadonlyMap<string, KnownReport>,
+): void {
+  for (const [id, report] of reports) {
+    const known = target.get(id);
+    if (!known) {
+      target.set(id, { ...report, logins: [...report.logins] });
+      continue;
+    }
+    for (const login of report.logins) {
+      if (!known.logins.some((existing) => loginKey(existing) === loginKey(login)))
+        known.logins.push(login);
+    }
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))
+      : item,
+  );
+}
+
 // Inputs are opaque JSON locators. Canonical equality deduplicates discovery across scopes.
 function loginKey(login: Login): string {
-  return JSON.stringify(login, (_key, value) =>
-    value !== null && typeof value === "object" && !Array.isArray(value)
-      ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
-      : value,
-  );
+  return canonicalJson(login);
 }
 
 function cacheIdentity(id: string, known: KnownReport): string {

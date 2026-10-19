@@ -396,6 +396,10 @@ Resolve the session account from that session's launch environment. Return `[]` 
 Never scan default stores from session discovery or scan agents from global discovery. Discovery is a query, with no agent
 lifecycle hooks. Closed agents have no session scope until resumed.
 
+The Usage modal also runs session discovery, without a model, for each enabled provider whose
+configuration sets `env`, with `provider` set to the provider it extends. This lists logins such as a
+custom `CLAUDE_CONFIG_DIR` before any agent of that provider runs.
+
 Inputs name credential stores; never put credentials in inputs or reports. Paseo validates each
 input against your schema before calling `fetch()`. The same key in any scope is the same report;
 fetches share a five-minute cache only when their ordered login inputs match. Each login fetch

@@ -196,7 +196,7 @@ function formOption(input: {
 
 function buildProviderOptions(entries: readonly ProviderSnapshotEntry[]): AgentProfileFormOption[] {
   return entries
-    .filter((entry) => entry.enabled)
+    .filter((entry) => entry.enabled && !entry.hidden)
     .map((entry) =>
       formOption({
         id: entry.provider,

@@ -65,6 +65,9 @@ export const ProviderOverrideSchema = z.object({
   disallowedTools: z.array(z.string()).optional(),
   paseoTools: ProviderPaseoToolsPolicySchema.optional(),
   enabled: z.boolean().optional(),
+  // Hidden providers stay fully operational for API and plugin callers but are
+  // left out of provider pickers; plugins use this for providers they open themselves.
+  hidden: z.boolean().optional(),
   order: z.number().optional(),
 });
 

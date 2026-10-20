@@ -26,6 +26,8 @@ export interface AgentProviderDefinition {
   label: string;
   description: string;
   enabledByDefault?: boolean;
+  /** Hidden providers are omitted from pickers but remain usable by API and plugin callers. */
+  hidden?: boolean;
   defaultModeId: string | null;
   modes: AgentProviderModeDefinition[];
   voice?: {

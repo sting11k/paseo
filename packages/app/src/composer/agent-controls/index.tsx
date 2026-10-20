@@ -1592,7 +1592,9 @@ export const AgentControls = memo(function AgentControls({
   );
   const agentModelSelectorProviders = useMemo(() => {
     if (snapshotSelectedEntry) {
-      return buildSelectableProviderSelectorProviders([snapshotSelectedEntry]);
+      return buildSelectableProviderSelectorProviders([snapshotSelectedEntry], true, {
+        includeHidden: true,
+      });
     }
     return buildProviderSelectorProviders({
       providerDefinitions: agentProviderDefinitions,

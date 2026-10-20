@@ -302,6 +302,7 @@ function applyOverrideToDefinition(
     ...definition,
     label: override.label ?? definition.label,
     description: override.description ?? definition.description,
+    hidden: override.hidden ?? definition.hidden,
   };
 }
 
@@ -319,6 +320,7 @@ function createDerivedDefinition(
     id: providerId,
     label: override.label,
     description: override.description ?? baseDefinition.description,
+    hidden: override.hidden ?? baseDefinition.hidden,
   };
 }
 

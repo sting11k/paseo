@@ -972,6 +972,8 @@ export class Session {
       host: {
         emit: (msg) => this.emit(msg),
         isProviderVisibleToClient: (provider) => this.isProviderVisibleToClient(provider),
+        hasAgentOnProvider: (provider) =>
+          this.agentManager.listAgents().some((agent) => agent.provider === provider),
         supportsCustomModeIcons: () => this.supports(CLIENT_CAPS.customModeIcons),
         supportsCompactProviderSnapshots: () => this.supports(CLIENT_CAPS.compactProviderSnapshots),
         publishSnapshot: (project) => {

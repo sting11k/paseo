@@ -490,6 +490,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       [
         "agent_attention_required",
         "terminal_attention_required",
+        "plugin_notification",
         "agent_permission_request",
         "agent_permission_resolved",
         "agent.provider_subagents.update",
@@ -683,6 +684,25 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       });
     });
 
+    const unsubPluginNotification = onFeed("plugin_notification", (message) => {
+      if (message.type !== "plugin_notification") {
+        return;
+      }
+      if (!message.payload.shouldNotify) {
+        return;
+      }
+      void sendOsNotification({
+        title: message.payload.title,
+        body: message.payload.body,
+        // serverId + agentId route a tap to that agent's chat.
+        data: {
+          serverId: message.payload.serverId ?? serverId,
+          ...(message.payload.agentId ? { agentId: message.payload.agentId } : {}),
+          ...(message.payload.workspaceId ? { workspaceId: message.payload.workspaceId } : {}),
+        },
+      });
+    });
+
     return () => {
       void feeds
         .release()
@@ -698,6 +718,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       unsubTranscription();
       unsubVoiceInputState();
       unsubTerminalAttention();
+      unsubPluginNotification();
     };
   }, [
     client,

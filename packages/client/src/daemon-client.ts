@@ -2175,6 +2175,28 @@ export class DaemonClient {
     });
   }
 
+  async sendPluginNotification(params: {
+    title: string;
+    body?: string;
+    agentId?: string;
+    workspaceId?: string;
+  }): Promise<void> {
+    const requestId = this.createRequestId();
+    await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: {
+        type: "plugin_notification.request",
+        requestId,
+        title: params.title,
+        ...(params.body !== undefined ? { body: params.body } : {}),
+        ...(params.agentId !== undefined ? { agentId: params.agentId } : {}),
+        ...(params.workspaceId !== undefined ? { workspaceId: params.workspaceId } : {}),
+      },
+      responseType: "plugin_notification.response",
+      timeout: 10_000,
+    });
+  }
+
   async ping(params?: { requestId?: string; timeoutMs?: number }): Promise<{
     requestId: string;
     clientSentAt: number;

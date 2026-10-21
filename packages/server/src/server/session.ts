@@ -458,6 +458,12 @@ export interface SessionOptions {
   logger: pino.Logger;
   downloadTokenStore: DownloadTokenStore;
   pushNotifications: PushNotifications;
+  broadcastPluginNotification?: (params: {
+    title: string;
+    body?: string;
+    agentId?: string;
+    workspaceId?: string;
+  }) => Promise<void>;
   paseoHome: string;
   worktreesRoot?: string;
   agentManager: AgentManager;
@@ -739,6 +745,7 @@ export class Session {
   private readonly workspaceRecovery: WorkspaceRecoveryService;
   private readonly daemonConfigStore: DaemonConfigStore;
   private readonly pushNotifications: PushNotifications;
+  private readonly broadcastPluginNotification: SessionOptions["broadcastPluginNotification"];
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private unsubscribeAgentEvents: (() => void) | null = null;
@@ -875,6 +882,7 @@ export class Session {
     this.onLifecycleIntent = onLifecycleIntent ?? null;
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
     this.pushNotifications = pushNotifications;
+    this.broadcastPluginNotification = options.broadcastPluginNotification;
     this.paseoHome = paseoHome;
     this.messageReceipts = options.messageReceipts;
     this.creationService = options.creationService;
@@ -3164,6 +3172,18 @@ export class Session {
         }
         this.emit({
           type: "push.unregister.response",
+          payload: { requestId: msg.requestId },
+        });
+        return;
+      case "plugin_notification.request":
+        void this.broadcastPluginNotification?.({
+          title: msg.title,
+          body: msg.body,
+          agentId: msg.agentId,
+          workspaceId: msg.workspaceId,
+        });
+        this.emit({
+          type: "plugin_notification.response",
           payload: { requestId: msg.requestId },
         });
         return;

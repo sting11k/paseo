@@ -38,6 +38,7 @@ import { CodexAppServerAgentClient } from "./providers/codex-app-server-agent.js
 import { CopilotACPAgentClient } from "./providers/copilot-acp-agent.js";
 import { CursorACPAgentClient } from "./providers/cursor-acp-agent.js";
 import { GenericACPAgentClient } from "./providers/generic-acp-agent.js";
+import { DERIVED_PROVIDER_ICON_SVGS } from "./derived-provider-icons.js";
 import { KimiACPAgentClient } from "./providers/kimi-acp-agent.js";
 import { KiroACPAgentClient } from "./providers/kiro-acp-agent.js";
 import { OpenCodeRuntimeClient } from "./providers/opencode/runtime-client.js";
@@ -310,7 +311,7 @@ function createDerivedDefinition(
   providerId: string,
   baseDefinition: AgentProviderDefinition,
   override: ProviderOverride,
-): AgentProviderDefinition {
+): AgentProviderDefinition & { iconSvg?: string } {
   if (!override.label) {
     throw new Error(`Custom provider '${providerId}' requires a label`);
   }
@@ -321,6 +322,9 @@ function createDerivedDefinition(
     label: override.label,
     description: override.description ?? baseDefinition.description,
     hidden: override.hidden ?? baseDefinition.hidden,
+    iconSvg:
+      (baseDefinition as { iconSvg?: string }).iconSvg ??
+      DERIVED_PROVIDER_ICON_SVGS[baseDefinition.id],
   };
 }
 

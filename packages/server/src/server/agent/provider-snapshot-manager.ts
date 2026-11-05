@@ -872,6 +872,7 @@ export class ProviderSnapshotManager {
           provider,
           status: definition.enabled ? "loading" : "unavailable",
           enabled: definition.enabled,
+          ...(definition.hidden ? { hidden: true } : {}),
           source: custom ? "custom" : "builtin",
           label: definition.label,
           description: definition.description,

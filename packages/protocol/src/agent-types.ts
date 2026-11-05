@@ -118,6 +118,8 @@ export interface ProviderSnapshotEntry {
   provider: AgentProvider;
   status: ProviderStatus;
   enabled: boolean;
+  /** Hidden providers are omitted from pickers but remain usable by API and plugin callers. */
+  hidden?: boolean;
   source?: "builtin" | "custom";
   error?: string;
   models?: AgentModelDefinition[];

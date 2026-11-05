@@ -146,9 +146,11 @@ export function buildProviderSelectorProviders(input: {
 export function buildSelectableProviderSelectorProviders(
   entries: ProviderSnapshotEntry[] | undefined,
   isConnected = true,
+  // An agent already running on a hidden provider still shows that provider's models.
+  options: { includeHidden?: boolean } = {},
 ): ProviderSelectorProvider[] {
   return (entries ?? [])
-    .filter((entry) => entry.enabled)
+    .filter((entry) => entry.enabled && (options.includeHidden || !entry.hidden))
     .map((entry) => {
       const label = entry.label ?? entry.provider;
       return {

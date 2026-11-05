@@ -8314,6 +8314,7 @@ export class Session {
         {
           agentId,
           messageId: msg.messageId,
+          unarchive: msg.unarchive,
           activeTurnBehavior: msg.activeTurnBehavior,
           textPrefix: msg.text.slice(0, 80),
         },
@@ -8325,7 +8326,7 @@ export class Session {
       });
       let deliveryStatus: "queued" | undefined;
       const send = async () => {
-        if (msg.sourceAgentId) {
+        if (msg.sourceAgentId && msg.unarchive !== false) {
           const receipt = this.agentMessages.enqueue({
             recipientId: agentId,
             messageId: msg.messageId,
@@ -8353,7 +8354,15 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
-          activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+          unarchive: msg.unarchive,
+          source: msg.sourceAgentId
+            ? {
+                kind: "agent-message",
+                agentId: msg.sourceAgentId,
+                serverId: msg.sourceAgentServerId,
+              }
+            : undefined,
+          activeTurnBehavior: msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
           sessionMode: msg.sessionMode,
           clearPendingPermissions: true,
           logger: this.sessionLogger,
@@ -8366,24 +8375,30 @@ export class Session {
           );
         }
       };
-      const sent = msg.messageId
-        ? this.messageReceipts.send({
-            agentId,
-            messageId: msg.messageId,
-            request: {
-              prompt,
-              sourceAgentId: msg.sourceAgentId,
-              sourceAgentServerId: msg.sourceAgentServerId,
-              sessionMode: msg.sessionMode,
-              activeTurnBehavior:
-                msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
-            },
-            prepare: async () => {
-              if (!msg.sourceAgentId) await this.prepareAgentMessage(agentId, msg.text);
-            },
-            send,
-          })
-        : send();
+      const admit = () =>
+        msg.messageId
+          ? this.messageReceipts.send({
+              agentId,
+              messageId: msg.messageId,
+              request: {
+                prompt,
+                ...(msg.unarchive === false ? { unarchive: false } : {}),
+                sourceAgentId: msg.sourceAgentId,
+                sourceAgentServerId: msg.sourceAgentServerId,
+                sessionMode: msg.sessionMode,
+                activeTurnBehavior:
+                  msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
+              },
+              prepare: async () => {
+                if (!msg.sourceAgentId) await this.prepareAgentMessage(agentId, msg.text);
+              },
+              send,
+            })
+          : send();
+      const sent =
+        msg.unarchive === false
+          ? this.agentManager.admitPromptIfNotArchived(agentId, admit)
+          : admit();
       void sent.catch((error) => {
         if (deliveryStatus === "queued") {
           this.handleAgentRunError(agentId, error, "Failed to dispatch queued agent message");
@@ -8411,6 +8426,9 @@ export class Session {
           agentId: resolved.agentId,
           accepted: false,
           error: errorToFriendlyMessage(error),
+          ...(error instanceof Error && "code" in error && error.code === "AGENT_ARCHIVED"
+            ? { errorCode: "AGENT_ARCHIVED" }
+            : {}),
         },
       });
     }

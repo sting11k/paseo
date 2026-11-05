@@ -1419,6 +1419,8 @@ export const FetchAgentRequestMessageSchema = z.object({
 });
 
 export const SendAgentMessageRequestSchema = z.object({
+  /** False requires atomic archive-preserving admission. Omitted retains human send behavior. */
+  unarchive: z.boolean().optional(),
   type: z.literal("send_agent_message_request"),
   requestId: z.string(),
   /** Accepts full ID, unique prefix, or exact full title (server resolves). */
@@ -3886,6 +3888,7 @@ export const ServerInfoStatusPayloadSchema = z
         canonicalSubmittedPrompts: z.boolean().optional(),
         agentMessageProvenance: z.boolean().optional(),
         agentMessageBatching: z.boolean().optional(),
+        archivePreservingSend: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
         agentTurnIdentity: z.boolean().optional(),
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
@@ -5141,6 +5144,7 @@ export const SendAgentMessageResponseMessageSchema = z.object({
     accepted: z.boolean(),
     deliveryStatus: z.literal("queued").optional(),
     error: z.string().nullable(),
+    errorCode: z.string().optional(),
   }),
 });
 

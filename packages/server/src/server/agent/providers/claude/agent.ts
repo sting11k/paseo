@@ -2371,7 +2371,6 @@ class ClaudeAgentSession implements AgentSession {
   private historySessionId: string | null = null;
   private replayingHistory = false;
   private turnState: TurnState = "idle";
-  private nextTurnOrdinal = 1;
   private cancelCurrentTurn: (() => void) | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
@@ -3933,7 +3932,8 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private createTurnId(owner: "foreground" | "autonomous"): string {
-    return `${owner}-turn-${this.nextTurnOrdinal++}`;
+    // A durable conversation can outlive this runtime (idle collection, reload, restart).
+    return `${owner}-turn-${randomUUID()}`;
   }
 
   private isTerminalTurnEvent(event: AgentStreamEvent): boolean {

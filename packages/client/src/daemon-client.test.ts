@@ -1,3 +1,4 @@
+import { createPaseoApi } from "./index.js";
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, expectTypeOf, test, vi } from "vitest";
 import { z } from "zod";
@@ -10590,3 +10591,49 @@ test("disposing a route before its deferred close does not reopen it on origin r
   expect(opened).not.toHaveBeenCalled();
   expect(closed).toHaveBeenCalledTimes(1);
 });
+
+test.each([false, true])(
+  "archive-preserving send fails closed with host support=%s",
+  async (supported) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "guarded-send",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    transport.triggerOpen({ features: { archivePreservingSend: supported } });
+    await connecting;
+    const api = createPaseoApi(client);
+    const agent = api.agents.ref("recipient");
+    expect(agent.supportsArchivePreservingSend).toBe(supported);
+    if (!supported) {
+      await expect(client.sendIfNotArchived("recipient", "automated")).rejects.toMatchObject({
+        code: "ARCHIVE_PRESERVING_SEND_UNSUPPORTED",
+      });
+      expect(transport.sent).toHaveLength(0);
+      return;
+    }
+    const sending = client.sendIfNotArchived("recipient", "automated", { messageId: "guarded" });
+    const refused = expect(sending).rejects.toMatchObject({ code: "AGENT_ARCHIVED" });
+    const request = parseSentFrame(transport.sent[0]);
+    expect(request).toMatchObject({ unarchive: false, messageId: "guarded" });
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: request.requestId,
+          agentId: "recipient",
+          accepted: false,
+          error: "Archived",
+          errorCode: "AGENT_ARCHIVED",
+        },
+      }),
+    );
+    await refused;
+    transport.triggerServerInfo({ archivePreservingSend: false });
+    expect(agent.supportsArchivePreservingSend).toBe(false);
+  },
+);

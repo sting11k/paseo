@@ -444,6 +444,9 @@ export interface PaseoAgentHandle {
    */
   reload(options?: { requestId?: string }): Promise<PaseoAgentRefetchResult | null>;
   send(text: string, options?: PaseoAgentSendOptions): Promise<void>;
+  /** Refuses archived recipients before loading or dispatch; requires host support. */
+  sendIfNotArchived(text: string, options?: PaseoAgentSendOptions): Promise<void>;
+  readonly supportsArchivePreservingSend: boolean;
   respondToPermission(options: PaseoAgentRespondToPermissionOptions): Promise<void>;
   /**
    * Changes the agent's own options: top-level keys replace, `null` removes the key so the
@@ -1168,6 +1171,12 @@ function createAgentHandleFactory(
         const result = await daemonClient.fetchAgent({ agentId: id });
         current = result?.agent ?? null;
         return result;
+      },
+      get supportsArchivePreservingSend() {
+        return daemonClient.getLastServerInfoMessage()?.features?.archivePreservingSend === true;
+      },
+      sendIfNotArchived: async (text, options) => {
+        await daemonClient.sendIfNotArchived(id, text, options);
       },
       send: async (text, options) => {
         await daemonClient.sendAgentMessage(id, text, options);

@@ -862,6 +862,7 @@ export class AgentManager {
     { readonly openedAt: number }
   >();
   private readonly collectingRuntimes = new Set<string>();
+  private readonly promptAdmissionTails = new Map<string, Promise<void>>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
@@ -2212,7 +2213,9 @@ export class AgentManager {
   }
 
   async archiveAgent(agentId: string, archivedAt?: string): Promise<{ archivedAt: string }> {
-    return this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId, archivedAt));
+    return this.runPromptAdmission(agentId, () =>
+      this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId, archivedAt)),
+    );
   }
 
   private async archiveAgentUnlocked(
@@ -2285,26 +2288,28 @@ export class AgentManager {
       if (!child || child.archivedAt || child.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
         continue;
       }
-      await this.runLifecycleMutation(child.id, async () => {
-        const currentChild = await registry.get(child.id);
-        if (
-          !currentChild ||
-          currentChild.archivedAt ||
-          currentChild.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId
-        ) {
-          return;
-        }
-        if (shouldDetachFromArchivedParent(parent, currentChild)) {
-          const detached = await this.detachAgentUnlocked(currentChild.id);
-          if (!detached.live) {
-            this.dispatchStoredAgentState(detached.record);
+      await this.runPromptAdmission(child.id, () =>
+        this.runLifecycleMutation(child.id, async () => {
+          const currentChild = await registry.get(child.id);
+          if (
+            !currentChild ||
+            currentChild.archivedAt ||
+            currentChild.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId
+          ) {
+            return;
           }
-        } else if (this.agents.has(currentChild.id)) {
-          await this.archiveAgentUnlocked(currentChild.id, parent.archivedAt);
-        } else {
-          await this.archiveSnapshotUnlocked(currentChild.id, parent.archivedAt);
-        }
-      });
+          if (shouldDetachFromArchivedParent(parent, currentChild)) {
+            const detached = await this.detachAgentUnlocked(currentChild.id);
+            if (!detached.live) {
+              this.dispatchStoredAgentState(detached.record);
+            }
+          } else if (this.agents.has(currentChild.id)) {
+            await this.archiveAgentUnlocked(currentChild.id, parent.archivedAt);
+          } else {
+            await this.archiveSnapshotUnlocked(currentChild.id, parent.archivedAt);
+          }
+        }),
+      );
     }
     // Internal children never reach storage, so the scan above cannot see them.
     // They have no tab to keep open and no listing to detach into, so they
@@ -2313,13 +2318,15 @@ export class AgentManager {
       if (!child.internal || getParentAgentIdFromLabels(child.labels) !== parentAgentId) {
         continue;
       }
-      await this.runLifecycleMutation(child.id, async () => {
-        const current = this.agents.get(child.id);
-        if (!current || getParentAgentIdFromLabels(current.labels) !== parentAgentId) {
-          return;
-        }
-        await this.archiveAgentUnlocked(current.id, parent.archivedAt);
-      });
+      await this.runPromptAdmission(child.id, () =>
+        this.runLifecycleMutation(child.id, async () => {
+          const current = this.agents.get(child.id);
+          if (!current || getParentAgentIdFromLabels(current.labels) !== parentAgentId) {
+            return;
+          }
+          await this.archiveAgentUnlocked(current.id, parent.archivedAt);
+        }),
+      );
     }
   }
 
@@ -2841,8 +2848,8 @@ export class AgentManager {
   }
 
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.archiveSnapshotUnlocked(agentId, archivedAt),
+    return this.runPromptAdmission(agentId, () =>
+      this.runLifecycleMutation(agentId, () => this.archiveSnapshotUnlocked(agentId, archivedAt)),
     );
   }
 
@@ -2967,6 +2974,38 @@ export class AgentManager {
     }
 
     await this.writeStoredMetadata(agentId, updates);
+  }
+
+  /** Serializes only admission/start with archive; never holds a model turn. */
+  async admitPromptIfNotArchived<T>(agentId: string, admit: () => Promise<T>): Promise<T> {
+    return this.runPromptAdmission(agentId, async () => {
+      const record = await this.requireRegistry().get(agentId);
+      if (!record) throw new Error(`Agent not found: ${agentId}`);
+      if (record.archivedAt) {
+        throw Object.assign(new Error(`Agent is archived: ${agentId}`), { code: "AGENT_ARCHIVED" });
+      }
+      return admit();
+    });
+  }
+
+  private runPromptAdmission<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    // Admission precedes lifecycle: loading and plugin reload can enter lifecycle below it.
+    // Archive cascades acquire each child's admission before that child's lifecycle lane.
+    // An uncontended admission enters synchronously so callers keep their lifecycle order.
+    const previous = this.promptAdmissionTails.get(agentId);
+    const result = previous
+      ? previous.catch(() => undefined).then(operation)
+      : new Promise<T>((settle) => settle(operation()));
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.promptAdmissionTails.set(agentId, tail);
+    void tail.finally(() => {
+      if (this.promptAdmissionTails.get(agentId) === tail)
+        this.promptAdmissionTails.delete(agentId);
+    });
+    return result;
   }
 
   private async runLifecycleMutation<T>(agentId: string, mutation: () => Promise<T>): Promise<T> {

@@ -543,6 +543,12 @@ function resolveProfileLists(persisted: ReturnType<typeof loadPersistedConfig>) 
   };
 }
 
+function resolveMcpInjectIntoProviders(
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): string[] | undefined {
+  return persisted.daemon?.mcp?.injectIntoProviders;
+}
+
 function resolveStaticLoadConfigSettings(
   env: NodeJS.ProcessEnv,
   cli: CliConfigOverrides | undefined,
@@ -553,6 +559,7 @@ function resolveStaticLoadConfigSettings(
     mcpInjectIntoAgents:
       cli?.mcpInjectIntoAgents ?? persisted.daemon?.mcp?.injectIntoAgents ?? false,
     usageEnabled: resolveUsageEnabled(persisted),
+    mcpInjectIntoProviders: resolveMcpInjectIntoProviders(persisted),
     browserToolsEnabled: resolveBrowserToolsEnabled(persisted),
     autoArchiveAfterMerge: persisted.daemon?.autoArchiveAfterMerge ?? false,
     appendSystemPrompt: resolveAppendSystemPrompt(persisted),
@@ -581,6 +588,7 @@ export type ResolvedDaemonSettings = Pick<
   | "trustedProxies"
   | "mcpEnabled"
   | "mcpInjectIntoAgents"
+  | "mcpInjectIntoProviders"
   | "usageEnabled"
   | "browserToolsEnabled"
   | "git"

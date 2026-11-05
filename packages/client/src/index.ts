@@ -496,6 +496,20 @@ export interface PaseoConfigActions {
   ): Promise<{ requestId: string; config: MutableDaemonConfig }>;
 }
 
+export interface PaseoNotificationActions {
+  /**
+   * Shows a notification on connected Paseo clients and, when no client is
+   * present, pushes to registered mobile devices. `agentId` routes the tap to
+   * that agent's chat.
+   */
+  send(params: {
+    title: string;
+    body?: string;
+    agentId?: string;
+    workspaceId?: string;
+  }): Promise<void>;
+}
+
 export interface PaseoApi {
   readonly hosts: PaseoHostActions;
   dispose(): Promise<void>;
@@ -506,6 +520,7 @@ export interface PaseoApi {
   readonly agents: PaseoAgentActions;
   readonly providers: PaseoProviderActions;
   readonly config: PaseoConfigActions;
+  readonly notifications: PaseoNotificationActions;
 }
 
 export interface PaseoClient extends PaseoApi {
@@ -797,6 +812,9 @@ export function createPaseoApi(
     config: {
       get: (requestId) => daemonClient.getDaemonConfig(requestId),
       patch: (patch, requestId) => daemonClient.patchDaemonConfig(patch, requestId),
+    },
+    notifications: {
+      send: (params) => daemonClient.sendPluginNotification(params),
     },
   };
 }

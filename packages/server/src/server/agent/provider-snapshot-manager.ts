@@ -17,6 +17,7 @@ import {
   type AgentMode,
   type AgentModelDefinition,
   type AgentProvider,
+  type AgentUsageSession,
   type FetchCatalogOptions,
   type ProviderSnapshotEntry,
 } from "./agent-sdk-types.js";
@@ -28,9 +29,10 @@ import type { ManagedAgent } from "./agent-manager.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { ManagedProcessRegistry } from "../managed-processes/managed-processes.js";
 import type { OpenCodeBridge } from "./providers/opencode/bridge.js";
-import type {
-  AgentProviderRuntimeSettingsMap,
-  ProviderOverride,
+import {
+  createProviderEnv,
+  type AgentProviderRuntimeSettingsMap,
+  type ProviderOverride,
 } from "./provider-launch-config.js";
 import {
   buildProviderRegistry,
@@ -354,6 +356,24 @@ export class ProviderSnapshotManager {
 
   getProviderLabel(provider: AgentProvider): string {
     return this.generation.definitions[provider]?.label ?? provider;
+  }
+
+  /**
+   * Launch environments of enabled providers whose configuration sets env, tagged with the provider
+   * they extend. Lets host usage find logins such as CLAUDE_CONFIG_DIR before any agent of that
+   * provider runs.
+   */
+  listUsageLaunches(): Array<Omit<AgentUsageSession, "sessionKey">> {
+    return Object.values(this.generation.definitions).flatMap((definition) => {
+      const runtimeSettings = definition.configuration?.runtimeSettings;
+      if (!definition.enabled || Object.keys(runtimeSettings?.env ?? {}).length === 0) return [];
+      return [
+        {
+          provider: definition.derivedFromProviderId ?? definition.id,
+          env: createProviderEnv({ runtimeSettings }),
+        },
+      ];
+    });
   }
 
   getAgentManagerProviderState(): AgentManagerProviderState {

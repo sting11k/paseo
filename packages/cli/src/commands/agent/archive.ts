@@ -57,19 +57,23 @@ export async function runArchiveCommand(
   const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {
-    const agents = await fetchAllAgents(client, { filter: { includeArchived: true } });
-    const agentId = resolveAgentId(agentIdArg, agents);
-    if (!agentId) {
+    const exactUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      agentIdArg,
+    );
+    const agents = exactUuid
+      ? []
+      : await fetchAllAgents(client, { filter: { includeArchived: true } });
+    const agentId = exactUuid ? agentIdArg : resolveAgentId(agentIdArg, agents);
+    const agent = exactUuid
+      ? (await client.fetchAgent({ agentId: agentIdArg }))?.agent
+      : agents.find((entry) => entry.id === agentId);
+    if (!agentId || !agent) {
       const error: CommandError = {
         code: "AGENT_NOT_FOUND",
         message: `Agent not found: ${agentIdArg}`,
         details: 'Use "paseo ls" to list available agents',
       };
       throw error;
-    }
-    const agent = agents.find((entry) => entry.id === agentId);
-    if (!agent) {
-      throw new Error(`Resolved agent missing from fetched agents: ${agentId}`);
     }
 
     // Check if agent is already archived

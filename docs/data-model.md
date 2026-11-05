@@ -201,7 +201,7 @@ snapshot so a mixed edit can apply its live subset and still name the paths that
     listen: "127.0.0.1:6767",
     hostnames: true | string[],   // legacy alias `allowedHosts` is migrated on load
     trustedProxies: true | string[], // defaults to ["loopback"]; Express proxy names/CIDRs
-    mcp: { enabled: boolean, injectIntoAgents: boolean },
+    mcp: { enabled: boolean, injectIntoAgents: boolean, injectIntoProviders?: string[] },
     git: { maxProcessesPerSecond: number, maxProcessConcurrency: number },
     appendSystemPrompt: string,    // appended to supported provider system/developer prompts
     terminalProfiles: TerminalProfile[],  // named shell commands; omitted means DEFAULT_TERMINAL_PROFILES
@@ -306,10 +306,10 @@ Browser tools also require `daemon.browserTools.enabled` and a connected browser
 This policy controls the catalog presented to an agent. It is not an authorization boundary for
 agents that can access the host through a shell.
 
-`daemon.mcp.injectIntoAgents` is the global override. When it is `false`, no provider receives
-Paseo tools; otherwise the provider policy applies. Provider and global policy are resolved when a
-session is created, resumed, imported, or reloaded, so configuration changes affect the next
-session rather than an already-running one.
+The daemon MCP switches and exact-ID `daemon.mcp.injectIntoProviders` allowlist bound provider
+policy. See [injection and reload semantics](../public-docs/mcp.md). Provider and global policy
+are resolved when a session is created, resumed, imported, or reloaded, so configuration changes
+affect the next session rather than an already-running one.
 
 `agents.metadataGeneration.providers` selects the models for daemon-side metadata tasks: commit messages, PR text, branch names, and generated titles. An empty list is Automatic; a non-empty list is Manual and only those models are tried. See [public-docs/metadata-generation.md](../public-docs/metadata-generation.md#how-a-model-is-chosen).
 

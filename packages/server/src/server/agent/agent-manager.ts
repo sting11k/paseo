@@ -342,6 +342,7 @@ export interface AgentManagerOptions {
   mcpAuthToken?: string;
   pluginAgentTools?: PluginAgentToolsRuntime;
   paseoToolsEnabled?: boolean;
+  paseoToolProviderIds?: readonly string[];
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
   appendSystemPrompt?: string;
@@ -783,6 +784,7 @@ export class AgentManager {
   private readonly attachedPluginTools = new Map<string, AttachedAgentTool[]>();
   private readonly pluginAgentTools: PluginAgentToolsRuntime | undefined;
   private paseoToolsEnabled = true;
+  private paseoToolProviderIds: ReadonlySet<string> | null = null;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
   private readonly resolvePaseoToolPolicy: (
@@ -835,6 +837,7 @@ export class AgentManager {
 
   private configurePaseoTools(options: AgentManagerOptions): void {
     this.paseoToolsEnabled = options.paseoToolsEnabled ?? true;
+    this.setPaseoToolProviderIds(options.paseoToolProviderIds);
     this.paseoToolCatalogFactory = options.paseoToolCatalogFactory ?? null;
   }
 
@@ -898,6 +901,10 @@ export class AgentManager {
 
   setPaseoToolsEnabled(enabled: boolean): void {
     this.paseoToolsEnabled = enabled;
+  }
+
+  setPaseoToolProviderIds(providerIds: readonly string[] | undefined): void {
+    this.paseoToolProviderIds = providerIds === undefined ? null : new Set(providerIds);
   }
 
   setPaseoToolCatalogFactory(factory: PaseoToolCatalogFactory | null): void {
@@ -5535,7 +5542,7 @@ export class AgentManager {
       env: options.env,
       purpose: options.purpose,
     });
-    const paseoToolPolicy = this.paseoToolsEnabled
+    const paseoToolPolicy = this.shouldInjectPaseoTools(storedConfig.provider)
       ? this.resolvePaseoToolPolicy(storedConfig.provider)
       : { enabled: false };
     const launchConfig = this.applyDaemonAppendSystemPrompt(
@@ -5637,6 +5644,13 @@ export class AgentManager {
     }
     this.sessionOpenGenerations.set(agentId, generation);
     return context;
+  }
+
+  private shouldInjectPaseoTools(provider: AgentProvider): boolean {
+    return (
+      this.paseoToolsEnabled &&
+      (this.paseoToolProviderIds === null || this.paseoToolProviderIds.has(provider))
+    );
   }
 
   private resolveProviderLaunchConfig(

@@ -28,7 +28,10 @@ type ProviderOverride = import("./agent/provider-launch-config.js").ProviderOver
 
 interface SupportedMutableConfigPatch {
   relay?: { enabled?: boolean; requireProtectedSecurity?: boolean };
-  mcp?: { injectIntoAgents?: boolean };
+  mcp?: {
+    injectIntoAgents?: boolean;
+    injectIntoProviders?: MutableDaemonConfig["mcp"]["injectIntoProviders"] | null;
+  };
   usage?: { enabled: boolean };
   browserTools?: { enabled?: boolean };
   providers?: MutableDaemonConfig["providers"];
@@ -336,13 +339,26 @@ function pickRelayPatch(
   return Object.keys(picked).length > 0 ? { relay: picked } : {};
 }
 
+function pickSupportedMcpPatch(
+  patch: MutableDaemonConfigPatch["mcp"],
+): SupportedMutableConfigPatch["mcp"] {
+  if (patch?.injectIntoAgents === undefined && patch?.injectIntoProviders === undefined) {
+    return undefined;
+  }
+  return {
+    ...(patch.injectIntoAgents !== undefined ? { injectIntoAgents: patch.injectIntoAgents } : {}),
+    ...(patch.injectIntoProviders !== undefined
+      ? { injectIntoProviders: patch.injectIntoProviders }
+      : {}),
+  };
+}
+
 function pickSupportedPatchFields(patch: MutableDaemonConfigPatch): SupportedMutableConfigPatch {
+  const mcp = pickSupportedMcpPatch(patch.mcp);
   return {
     ...pickRelayPatch(patch.relay),
     usage: patch.usage,
-    ...(patch.mcp?.injectIntoAgents !== undefined
-      ? { mcp: { injectIntoAgents: patch.mcp.injectIntoAgents } }
-      : {}),
+    ...(mcp ? { mcp } : {}),
     ...(patch.browserTools?.enabled !== undefined
       ? { browserTools: { enabled: patch.browserTools.enabled } }
       : {}),
@@ -491,6 +507,9 @@ export class DaemonConfigStore {
     const removedProviders = Array.from(new Set(removeProviders));
     const merged = deepMerge(this.current, configPatch);
     if (speechPatch !== undefined) Object.assign(merged, this.readPatchedSpeech(speechPatch));
+    if (merged.mcp.injectIntoProviders === null) {
+      delete merged.mcp.injectIntoProviders;
+    }
     if (parsedPatch.skills?.selection !== undefined) {
       merged.skills = { selection: parsedPatch.skills.selection };
     }
@@ -577,6 +596,11 @@ export class DaemonConfigStore {
         providers: resolved.mutable.providers,
         source: "stored",
       }),
+      // File reload must not widen the injection boundary; explicit config patches can change it.
+      mcp: {
+        ...resolved.mutable.mcp,
+        injectIntoProviders: this.current.mcp.injectIntoProviders,
+      },
       plugins: this.current.plugins,
       ...this.readSpeech(persisted),
     });
@@ -853,6 +877,12 @@ function mergeMutableDaemonPatch(
     next.mcp = { ...next.mcp, injectIntoAgents: patch.mcp.injectIntoAgents };
   }
   if (patch.usage) next.usage = patch.usage;
+  if (patch.mcp?.injectIntoProviders !== undefined) {
+    const mcp = { ...next.mcp };
+    if (patch.mcp.injectIntoProviders === null) delete mcp.injectIntoProviders;
+    else mcp.injectIntoProviders = patch.mcp.injectIntoProviders;
+    next.mcp = mcp;
+  }
   if (patch.browserTools?.enabled !== undefined) {
     next.browserTools = { ...next.browserTools, enabled: patch.browserTools.enabled };
   }

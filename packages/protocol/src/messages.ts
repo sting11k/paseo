@@ -3292,6 +3292,44 @@ export const PushUnregisterResponseSchema = z.object({
   }),
 });
 
+// A plugin server asks the daemon to notify the humans: OS notification on connected clients and
+// a push to registered devices, planned like agent attention. `agentId`/`workspaceId` route a tap.
+export const PluginNotificationRequestSchema = z.object({
+  type: z.literal("plugin_notification.request"),
+  requestId: z.string(),
+  title: z.string(),
+  body: z.string().optional(),
+  agentId: z.string().optional(),
+  workspaceId: z.string().optional(),
+});
+
+// What became of the notification: shown on the present client (in_app), accepted by the push service for a
+// device (push), withheld because a present client is already looking at the target agent (suppressed), or
+// reached no one (error, with why). Absent from daemons that predate it.
+export const PluginNotificationOutcomeSchema = z.enum(["in_app", "push", "suppressed", "error"]);
+
+export const PluginNotificationResponseSchema = z.object({
+  type: z.literal("plugin_notification.response"),
+  payload: z.object({
+    requestId: z.string(),
+    outcome: PluginNotificationOutcomeSchema.optional(),
+    error: z.string().optional(),
+  }),
+});
+
+export const PluginNotificationSchema = z.object({
+  type: z.literal("plugin_notification"),
+  payload: z.object({
+    subscriptionId: z.string().optional(),
+    serverId: z.string().optional(),
+    agentId: z.string().optional(),
+    workspaceId: z.string().optional(),
+    title: z.string(),
+    body: z.string().optional(),
+    shouldNotify: z.boolean(),
+  }),
+});
+
 // ============================================================================
 // Terminal Messages
 // ============================================================================
@@ -3519,6 +3557,7 @@ export const SessionEventSubscriptionSchema = z.enum([
   "agent.provider_subagents.update",
   "agent.background_work.update",
   "terminal_attention_required",
+  "plugin_notification",
   "status.server_info",
   "status.daemon_config_changed",
   "status.plugin_catalog_changed",
@@ -3763,6 +3802,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ListCommandsRequestSchema,
   RegisterPushTokenMessageSchema,
   PushUnregisterRequestSchema,
+  PluginNotificationRequestSchema,
   ListTerminalsRequestSchema,
   SubscribeTerminalsRequestSchema,
   UnsubscribeTerminalsRequestSchema,
@@ -7698,6 +7738,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   StatusMessageSchema,
   PongMessageSchema,
   PushUnregisterResponseSchema,
+  PluginNotificationResponseSchema,
   RpcErrorMessageSchema,
   ArtifactMessageSchema,
   AgentUpdateMessageSchema,
@@ -7874,6 +7915,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CaptureTerminalResponseSchema,
   TerminalStreamExitSchema,
   TerminalAttentionRequiredSchema,
+  PluginNotificationSchema,
   ChatCreateResponseSchema,
   ChatListResponseSchema,
   ChatInspectResponseSchema,
@@ -8364,6 +8406,14 @@ export type ListCommandsResponse = z.infer<typeof ListCommandsResponseSchema>;
 export type RegisterPushTokenMessage = z.infer<typeof RegisterPushTokenMessageSchema>;
 export type PushUnregisterRequest = z.infer<typeof PushUnregisterRequestSchema>;
 export type PushUnregisterResponse = z.infer<typeof PushUnregisterResponseSchema>;
+export type PluginNotificationRequest = z.infer<typeof PluginNotificationRequestSchema>;
+export type PluginNotificationResponse = z.infer<typeof PluginNotificationResponseSchema>;
+export type PluginNotificationOutcome = z.infer<typeof PluginNotificationOutcomeSchema>;
+export interface PluginNotificationResult {
+  outcome: PluginNotificationOutcome;
+  error?: string;
+}
+export type PluginNotification = z.infer<typeof PluginNotificationSchema>;
 
 // Terminal message types
 export type ListTerminalsRequest = z.infer<typeof ListTerminalsRequestSchema>;

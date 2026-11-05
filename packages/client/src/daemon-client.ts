@@ -483,6 +483,8 @@ export interface DaemonClientTrace {
 }
 
 export interface SendMessageOptions {
+  /** False refuses archived recipients at host admission. */
+  unarchive?: boolean;
   sourceAgentId?: string;
   sourceAgentServerId?: string;
   sessionMode?: string;
@@ -4294,11 +4296,27 @@ export class DaemonClient {
   // Agent Interaction
   // ============================================================================
 
+  async sendIfNotArchived(
+    agentId: string,
+    text: string,
+    options: SendMessageOptions = {},
+  ): Promise<void> {
+    await this.sendAgentMessage(agentId, text, { ...options, unarchive: false });
+  }
+
   async sendAgentMessage(
     agentId: string,
     text: string,
     options: SendMessageOptions = {},
   ): Promise<{ deliveryStatus?: "queued" }> {
+    if (
+      options.unarchive === false &&
+      this.lastServerInfoMessage?.features?.archivePreservingSend !== true
+    ) {
+      throw Object.assign(new Error("Update the Paseo host for archive-preserving sends."), {
+        code: "ARCHIVE_PRESERVING_SEND_UNSUPPORTED",
+      });
+    }
     if (
       options.sourceAgentId &&
       this.lastServerInfoMessage?.features?.agentMessageProvenance !== true
@@ -4318,6 +4336,7 @@ export class DaemonClient {
       requestId,
       agentId,
       text,
+      unarchive: options.unarchive,
       sourceAgentId: options.sourceAgentId,
       sourceAgentServerId: options.sourceAgentServerId,
       sessionMode: options.sessionMode,
@@ -4341,7 +4360,9 @@ export class DaemonClient {
       },
     });
     if (!payload.accepted) {
-      throw new Error(payload.error ?? "sendAgentMessage rejected");
+      throw Object.assign(new Error(payload.error ?? "sendAgentMessage rejected"), {
+        code: payload.errorCode,
+      });
     }
     return payload.deliveryStatus ? { deliveryStatus: payload.deliveryStatus } : {};
   }

@@ -141,6 +141,7 @@ import type {
   AgentSkillSelection,
   AgentSkillsStatus,
   AgentSkillsSaveResult,
+  PluginNotificationResponse,
 } from "@getpaseo/protocol/messages";
 import type {
   AgentPermissionRequest,
@@ -2516,6 +2517,28 @@ export class DaemonClient {
       message: { type: "push.unregister.request", token, requestId },
       responseType: "push.unregister.response",
       timeout: PUSH_TOKEN_REVOCATION_TIMEOUT_MS,
+    });
+  }
+
+  async sendPluginNotification(params: {
+    title: string;
+    body?: string;
+    agentId?: string;
+    workspaceId?: string;
+  }): Promise<PluginNotificationResponse["payload"]> {
+    const requestId = this.createRequestId();
+    return this.sendCorrelatedSessionRequest({
+      requestId,
+      message: {
+        type: "plugin_notification.request",
+        requestId,
+        title: params.title,
+        ...(params.body !== undefined ? { body: params.body } : {}),
+        ...(params.agentId !== undefined ? { agentId: params.agentId } : {}),
+        ...(params.workspaceId !== undefined ? { workspaceId: params.workspaceId } : {}),
+      },
+      responseType: "plugin_notification.response",
+      timeout: 10_000,
     });
   }
 

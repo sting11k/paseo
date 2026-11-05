@@ -16,7 +16,7 @@ import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
 import { DaemonLinkEndpoint, VirtualHostSocket } from "./connected-hosts/index.js";
 import { ConnectedHosts } from "./connected-hosts/index.js";
 import { stat } from "node:fs/promises";
-import type { CreationSnapshot } from "@getpaseo/protocol/messages";
+import type { CreationSnapshot, PluginNotificationResult } from "@getpaseo/protocol/messages";
 import { CreationService } from "./creation/index.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { WebSocket, WebSocketServer } from "ws";
@@ -79,6 +79,7 @@ import {
   createPushNotifications,
   type PushNotifications,
   type PushNotificationSender,
+  type PushPayload,
 } from "./push/index.js";
 import type { ScriptHealthState } from "./script-health-monitor.js";
 import type { ServiceProxySubsystem } from "./service-proxy.js";
@@ -1651,6 +1652,7 @@ export class VoiceAssistantWebSocketServer {
       publishScriptStatusUpdate: (message) => this.publishScriptStatusUpdate(message),
       downloadTokenStore: this.downloadTokenStore,
       pushNotifications: this.pushNotifications,
+      broadcastPluginNotification: (params) => this.broadcastPluginNotification(params),
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
       agentManager: this.agentManager,
@@ -3043,6 +3045,90 @@ export class VoiceAssistantWebSocketServer {
       if (message.type === "session" && this.sessions.get(ws)?.session.delivery.isModern(ws))
         this.sessions.get(ws)!.session.publishToSource(ws, message.message);
       else this.sendToClient(ws, message);
+    }
+  }
+
+  public async broadcastPluginNotification(params: {
+    title: string;
+    body?: string;
+    agentId?: string;
+    workspaceId?: string;
+  }): Promise<PluginNotificationResult> {
+    // Tap routing needs serverId + workspaceId + agentId; resolve the workspace
+    // from the agent so plugins only have to name the agent.
+    const workspaceId =
+      params.workspaceId ??
+      (params.agentId ? this.agentManager.getAgent(params.agentId)?.workspaceId : undefined);
+    const target = {
+      ...(params.agentId ? { agentId: params.agentId } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+    };
+    const clientEntries: Array<{
+      ws: WebSocketLike;
+      state: ClientPresenceState;
+    }> = [];
+
+    for (const [ws, connection] of this.sessions) {
+      if (
+        !connection.session.delivery.isModern(ws) ||
+        !connection.session.wantsSourceEvent(ws, "plugin_notification")
+      ) {
+        continue;
+      }
+      clientEntries.push({
+        ws,
+        state: this.getClientActivityState(connection.session, ws),
+      });
+    }
+
+    const notificationEntries = clientEntries.filter(({ ws }) =>
+      this.sessions.get(ws)?.session.wantsSourceNotification(ws, "plugin_notification"),
+    );
+    const allStates = notificationEntries.map((e) => e.state);
+
+    const plan = computeNotificationPlan({
+      allStates,
+      focusTarget: params.agentId ? { kind: "agent", id: params.agentId } : null,
+      pushEligible: true,
+      nowMs: Date.now(),
+    });
+
+    const result: PluginNotificationResult = plan.shouldPush
+      ? await this.pushPluginNotification({
+          title: params.title,
+          body: params.body ?? "",
+          data: { serverId: this.serverId, ...target },
+        })
+      : { outcome: plan.inAppRecipientIndex !== null ? "in_app" : "suppressed" };
+
+    for (const { ws } of clientEntries) {
+      const shouldNotify =
+        plan.inAppRecipientIndex !== null &&
+        notificationEntries[plan.inAppRecipientIndex]?.ws === ws;
+      const message = wrapSessionMessage({
+        type: "plugin_notification",
+        payload: {
+          serverId: this.serverId,
+          ...target,
+          title: params.title,
+          ...(params.body ? { body: params.body } : {}),
+          shouldNotify,
+        },
+      });
+      if (message.type === "session" && this.sessions.get(ws)?.session.delivery.isModern(ws))
+        this.sessions.get(ws)!.session.publishToSource(ws, message.message);
+      else this.sendToClient(ws, message);
+    }
+    return result;
+  }
+
+  private async pushPluginNotification(payload: PushPayload): Promise<PluginNotificationResult> {
+    try {
+      await this.pushNotificationSender.send(payload);
+      return { outcome: "push" };
+    } catch (err) {
+      this.logger.warn({ err, title: payload.title }, "Failed to send push notification");
+      return { outcome: "error", error: err instanceof Error ? err.message : String(err) };
     }
   }
 }

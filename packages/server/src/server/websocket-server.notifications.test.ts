@@ -47,6 +47,10 @@ import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
 
 interface WebSocketServerInternals {
   sessions: Map<unknown, unknown>;
+  broadcastPluginNotification(params: {
+    title: string;
+    agentId?: string;
+  }): Promise<{ outcome: string; error?: string }>;
   broadcastAgentAttention(params: {
     agentId: string;
     reason: string;
@@ -77,9 +81,11 @@ function createWorkspaceAutoNameStub(): WorkspaceAutoName {
 
 class RecordingPushNotificationSender implements PushNotificationSender {
   readonly sent: PushPayload[] = [];
+  failure: Error | null = null;
 
   async send(payload: PushPayload): Promise<void> {
     this.sent.push(payload);
+    if (this.failure) throw this.failure;
   }
 }
 
@@ -363,5 +369,77 @@ describe("VoiceAssistantWebSocketServer notification payloads", () => {
 
     expect(readAttentionRequiredMessage(ws).shouldNotify).toBe(false);
     expect(pushNotifications.sent).toEqual([]);
+  });
+});
+
+function connectPluginClient(
+  server: VoiceAssistantWebSocketServer,
+  activity: { focusedAgentId: string | null; appVisible: boolean },
+) {
+  const ws = createOpenSocket();
+  const delivery = new SessionDelivery(() => {});
+  delivery.attach(ws, true);
+  const published: { payload: { shouldNotify: boolean } }[] = [];
+  asInternals<WebSocketServerInternals>(server).sessions.set(ws, {
+    kind: "trusted",
+    session: {
+      ...createSessionWithActivity({ deviceType: "web", lastActivityAt: new Date(), ...activity }),
+      delivery,
+      wantsSourceEvent: () => true,
+      wantsSourceNotification: () => true,
+      publishToSource: (_source: object, message: { payload: { shouldNotify: boolean } }) =>
+        published.push(message),
+    },
+    clientId: "client-test",
+    appVersion: null,
+    connectionLogger: createLogger(),
+    sockets: new Set([ws]),
+    externalDisconnectCleanupTimeout: null,
+  });
+  return published;
+}
+
+describe("VoiceAssistantWebSocketServer plugin notification outcome", () => {
+  const notice = { title: "1 việc cần bạn", agentId: "supervisor" };
+
+  it("reports in_app when a present client elsewhere is told to show it", async () => {
+    const { server, pushNotifications } = createServer();
+    const published = connectPluginClient(server, { focusedAgentId: "other", appVisible: true });
+
+    const result =
+      await asInternals<WebSocketServerInternals>(server).broadcastPluginNotification(notice);
+
+    expect(result).toEqual({ outcome: "in_app" });
+    expect(published.map((message) => message.payload.shouldNotify)).toEqual([true]);
+    expect(pushNotifications.sent).toEqual([]);
+  });
+
+  it("reports suppressed when a present client is already looking at the agent", async () => {
+    const { server, pushNotifications } = createServer();
+    const published = connectPluginClient(server, {
+      focusedAgentId: "supervisor",
+      appVisible: true,
+    });
+
+    const result =
+      await asInternals<WebSocketServerInternals>(server).broadcastPluginNotification(notice);
+
+    expect(result).toEqual({ outcome: "suppressed" });
+    expect(published.map((message) => message.payload.shouldNotify)).toEqual([false]);
+    expect(pushNotifications.sent).toEqual([]);
+  });
+
+  it("reports push once the push service accepted it, and error with why when it reached no device", async () => {
+    const { server, pushNotifications } = createServer();
+
+    const pushed =
+      await asInternals<WebSocketServerInternals>(server).broadcastPluginNotification(notice);
+    pushNotifications.failure = new Error("No registered push device");
+    const failed =
+      await asInternals<WebSocketServerInternals>(server).broadcastPluginNotification(notice);
+
+    expect(pushed).toEqual({ outcome: "push" });
+    expect(failed).toEqual({ outcome: "error", error: "No registered push device" });
+    expect(pushNotifications.sent).toHaveLength(2);
   });
 });

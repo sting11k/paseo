@@ -41,7 +41,9 @@ describe("push notifications", () => {
 
     pushNotifications.renew("ExponentPushToken[offline-device]");
     now += 48 * 60 * 60 * 1000;
-    await pushNotifications.send({ title: "Agent finished", body: "Done" });
+    await expect(pushNotifications.send({ title: "Agent finished", body: "Done" })).rejects.toThrow(
+      "No registered push device",
+    );
 
     expect(deliveries).toEqual([]);
     expect(JSON.parse(readFileSync(filePath, "utf8"))).toEqual({ subscriptions: [] });
@@ -60,7 +62,9 @@ describe("push notifications", () => {
 
     pushNotifications.renew("ExponentPushToken[online-device]");
     pushNotifications.revoke("ExponentPushToken[online-device]");
-    await pushNotifications.send({ title: "Agent finished", body: "Done" });
+    await expect(pushNotifications.send({ title: "Agent finished", body: "Done" })).rejects.toThrow(
+      "No registered push device",
+    );
 
     expect(deliveries).toEqual([]);
   });

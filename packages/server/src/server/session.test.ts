@@ -350,6 +350,7 @@ interface SessionForTestOptions {
   binaryMessages?: Uint8Array[];
   pluginRuntime?: SessionOptions["pluginRuntime"];
   orchestrationSkills?: SessionOptions["orchestrationSkills"];
+  broadcastPluginNotification?: SessionOptions["broadcastPluginNotification"];
   workspaceLabelService?: WorkspaceLabelService;
 }
 
@@ -462,10 +463,48 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     daemonVersion: options.daemonVersion,
     daemonRuntimeConfig: options.daemonRuntimeConfig,
     permissions: options.permissions ?? OWNER_PERMISSIONS,
+    broadcastPluginNotification: options.broadcastPluginNotification,
   };
   if (options.sendToSource) sessionOptions.onMessageToSource = options.sendToSource;
   return new Session(sessionOptions);
 }
+
+test("answers a plugin notification with what became of it, an error included", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const outcomes = [
+    async () => ({ outcome: "suppressed" as const }),
+    async () => {
+      throw new Error("relay down");
+    },
+  ];
+  const broadcastPluginNotification = vi.fn(async () => outcomes.shift()!());
+  const session = createSessionForTest({ messages, broadcastPluginNotification });
+
+  for (const requestId of ["seen", "failed"])
+    await session.handleMessage({
+      type: "plugin_notification.request",
+      requestId,
+      title: "1 việc cần bạn",
+      agentId: "supervisor",
+    });
+
+  expect(broadcastPluginNotification).toHaveBeenCalledWith({
+    title: "1 việc cần bạn",
+    body: undefined,
+    agentId: "supervisor",
+    workspaceId: undefined,
+  });
+  expect(messages.filter((message) => message.type === "plugin_notification.response")).toEqual([
+    {
+      type: "plugin_notification.response",
+      payload: { requestId: "seen", outcome: "suppressed" },
+    },
+    {
+      type: "plugin_notification.response",
+      payload: { requestId: "failed", outcome: "error", error: "relay down" },
+    },
+  ]);
+});
 
 test("routes host-scoped agent skills requests through the daemon owner", async () => {
   const messages: SessionOutboundMessage[] = [];

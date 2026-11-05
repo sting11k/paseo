@@ -37,9 +37,10 @@ export class PushService {
     this.revokeToken = revokeToken;
   }
 
+  /** Resolves once Expo accepted the push for at least one device; rejects with why it accepted none. */
   async sendPush(tokens: string[], payload: PushPayload): Promise<void> {
     if (tokens.length === 0) {
-      return;
+      throw new Error("No registered push device");
     }
 
     const messages: ExpoPushMessage[] = tokens.map((token) => ({
@@ -56,10 +57,18 @@ export class PushService {
       batches.push(messages.slice(i, i + MAX_BATCH_SIZE));
     }
 
-    await Promise.all(batches.map((batch) => this.sendBatch(batch)));
+    const results = await Promise.all(batches.map((batch) => this.sendBatch(batch)));
+    if (results.some((result) => result.accepted > 0)) {
+      return;
+    }
+    throw new Error(
+      results.find((result) => result.error)?.error ?? "Push service accepted no device",
+    );
   }
 
-  private async sendBatch(messages: ExpoPushMessage[]): Promise<void> {
+  private async sendBatch(
+    messages: ExpoPushMessage[],
+  ): Promise<{ accepted: number; error?: string }> {
     try {
       const response = await fetch(EXPO_PUSH_URL, {
         method: "POST",
@@ -75,22 +84,31 @@ export class PushService {
           { status: response.status, statusText: response.statusText },
           "Expo push API error",
         );
-        return;
+        return { accepted: 0, error: `Expo push API error ${response.status}` };
       }
 
       const result = (await response.json()) as { data: ExpoPushTicket[] };
-      this.handleTickets(messages, result.data);
+      return this.handleTickets(messages, result.data);
     } catch (error) {
       this.logger.error({ err: error }, "Failed to send push notifications");
+      return { accepted: 0, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
-  private handleTickets(messages: ExpoPushMessage[], tickets: ExpoPushTicket[]): void {
+  private handleTickets(
+    messages: ExpoPushMessage[],
+    tickets: ExpoPushTicket[],
+  ): { accepted: number; error?: string } {
+    let accepted = 0;
+    let error: string | undefined;
     for (let i = 0; i < tickets.length; i++) {
       const ticket = tickets[i];
       const message = messages[i];
 
-      if (ticket.status === "error") {
+      if (ticket.status === "ok") {
+        accepted++;
+      } else if (ticket.status === "error") {
+        error = ticket.details?.error ?? ticket.message ?? "Push failed for device";
         this.logger.error(
           { token: message.to, message: ticket.message, details: ticket.details },
           "Push failed for token",
@@ -105,5 +123,6 @@ export class PushService {
         }
       }
     }
+    return { accepted, ...(error ? { error } : {}) };
   }
 }

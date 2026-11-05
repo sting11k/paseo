@@ -14,7 +14,11 @@ import type {
 import { relative } from "node:path";
 import { isAbsolute } from "node:path";
 import { CreationService, type CreatedAgent } from "./creation/index.js";
-import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
+import type {
+  CreationSnapshot,
+  AgentCreateRequest,
+  PluginNotificationResult,
+} from "@getpaseo/protocol/messages";
 import type { MessageReceipts } from "./message-receipts/index.js";
 import equal from "fast-deep-equal";
 import { WorkspaceSetupObservation } from "./workspace-setup-observation.js";
@@ -462,6 +466,12 @@ export interface SessionOptions {
   logger: pino.Logger;
   downloadTokenStore: DownloadTokenStore;
   pushNotifications: PushNotifications;
+  broadcastPluginNotification?: (params: {
+    title: string;
+    body?: string;
+    agentId?: string;
+    workspaceId?: string;
+  }) => Promise<PluginNotificationResult>;
   paseoHome: string;
   worktreesRoot?: string;
   agentManager: AgentManager;
@@ -764,6 +774,7 @@ export class Session {
   private readonly workspaceRecovery: WorkspaceRecoveryService;
   private readonly daemonConfigStore: DaemonConfigStore;
   private readonly pushNotifications: PushNotifications;
+  private readonly broadcastPluginNotification: SessionOptions["broadcastPluginNotification"];
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private unsubscribeAgentEvents: (() => void) | null = null;
@@ -911,6 +922,7 @@ export class Session {
     this.onLifecycleIntent = onLifecycleIntent ?? null;
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
     this.pushNotifications = pushNotifications;
+    this.broadcastPluginNotification = options.broadcastPluginNotification;
     this.paseoHome = paseoHome;
     this.messageReceipts = options.messageReceipts;
     this.agentMessages = options.agentMessages;
@@ -3261,6 +3273,27 @@ export class Session {
           payload: { requestId: msg.requestId },
         });
         return;
+      case "plugin_notification.request": {
+        // The plugin learns what became of its notification, so it can keep unseen work pending.
+        let result: PluginNotificationResult;
+        try {
+          result = this.broadcastPluginNotification
+            ? await this.broadcastPluginNotification({
+                title: msg.title,
+                body: msg.body,
+                agentId: msg.agentId,
+                workspaceId: msg.workspaceId,
+              })
+            : { outcome: "error", error: "Notifications are unavailable" };
+        } catch (err) {
+          result = { outcome: "error", error: err instanceof Error ? err.message : String(err) };
+        }
+        this.emit({
+          type: "plugin_notification.response",
+          payload: { requestId: msg.requestId, ...result },
+        });
+        return;
+      }
     }
   }
 

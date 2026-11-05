@@ -10,6 +10,7 @@ const PUSH_TOKEN_LEASE_MS = 48 * 60 * 60 * 1000;
 export interface PushNotifications {
   renew(token: string): void;
   revoke(token: string): void;
+  /** Resolves once the push was accepted for at least one device; rejects with why it reached none. */
   send(payload: PushPayload): Promise<void>;
 }
 
@@ -38,7 +39,7 @@ export function createPushNotifications(options: {
     async send(payload) {
       const tokens = store.getActiveTokens();
       options.logger.info({ tokenCount: tokens.length }, "Sending push notification");
-      if (tokens.length === 0) return;
+      if (tokens.length === 0) throw new Error("No registered push device");
       await deliver(tokens, payload);
     },
   };

@@ -43,6 +43,9 @@ export interface ProviderCatalogSessionHost {
   // COMPAT(providersSnapshot): visibility gating for older clients lives on the shell
   // (agent-lifecycle shares it). Reads appVersion live.
   isProviderVisibleToClient(provider: string): boolean;
+  // A hidden provider leaves the snapshot only while nothing runs on it: an agent's
+  // controls read its provider's entry, so one in use stays listed.
+  hasAgentOnProvider(provider: string): boolean;
   // COMPAT(customModeIcons): reads clientCapabilities live.
   supportsCustomModeIcons(): boolean;
   supportsCompactProviderSnapshots(): boolean;
@@ -121,8 +124,10 @@ export class ProviderCatalogSession {
     // COMPAT(providersSnapshot): use the shell's current visibility policy for both sides.
     return {
       ...snapshot,
-      records: snapshot.records.filter(({ entry }) =>
-        this.host.isProviderVisibleToClient(entry.provider),
+      records: snapshot.records.filter(
+        ({ entry }) =>
+          this.host.isProviderVisibleToClient(entry.provider) &&
+          (!entry.hidden || this.host.hasAgentOnProvider(entry.provider)),
       ),
     };
   }

@@ -20,6 +20,7 @@ type SnapshotChangeHandler = (transition: ProviderSnapshotTransition) => void;
 
 interface MakeOptions {
   visibleProviders?: Set<string>;
+  agentProviders?: Set<string>;
   supportsCustomModeIcons?: boolean;
   supportsCompactProviderSnapshots?: boolean;
   snapshot?: Partial<ProviderSnapshotManager>;
@@ -50,6 +51,7 @@ function makeSubsystem(options: MakeOptions = {}) {
   const host: ProviderCatalogSessionHost = {
     emit: (msg) => emitted.push(msg),
     isProviderVisibleToClient: (provider) => visible.has(provider),
+    hasAgentOnProvider: (provider) => options.agentProviders?.has(provider) ?? false,
     supportsCustomModeIcons: () => options.supportsCustomModeIcons ?? false,
     supportsProviderSnapshotReferences: () => false,
     publishSnapshot: (project) => {
@@ -117,6 +119,31 @@ describe("ProviderCatalogSession", () => {
 
     const push = findByType(emitted, "providers_snapshot_update");
     const pull = findByType(emitted, "get_providers_snapshot_response");
+    expect(pull?.payload.entries).toEqual(push?.payload.entries);
+  });
+
+  it("drops hidden providers from PUSH and PULL unless an agent runs on them", async () => {
+    const entries: ProviderSnapshotEntry[] = [
+      { provider: "codex", status: "ready", enabled: true, modes: [] },
+      { provider: "lw-lead", status: "ready", enabled: true, hidden: true, modes: [] },
+      { provider: "lw-peer", status: "ready", enabled: true, hidden: true, modes: [] },
+    ];
+    const { subsystem, emitted, pushSnapshotChange } = makeSubsystem({
+      visibleProviders: new Set(["codex", "lw-lead", "lw-peer"]),
+      agentProviders: new Set(["lw-peer"]),
+      snapshot: { getSnapshot: () => createProviderSnapshot(entries) },
+    });
+
+    subsystem.start();
+    pushSnapshotChange(createProviderSnapshot(entries));
+    await subsystem.handleGetProvidersSnapshotRequest({
+      type: "get_providers_snapshot_request",
+      requestId: "hidden",
+    });
+
+    const push = findByType(emitted, "providers_snapshot_update");
+    const pull = findByType(emitted, "get_providers_snapshot_response");
+    expect(push?.payload.entries.map((entry) => entry.provider)).toEqual(["codex", "lw-peer"]);
     expect(pull?.payload.entries).toEqual(push?.payload.entries);
   });
 

@@ -145,6 +145,19 @@ describe("combined model selector data", () => {
     ).toEqual([]);
   });
 
+  it("excludes hidden providers from selector data unless explicitly included", () => {
+    const hidden = snapshotEntry({
+      provider: "codewhale",
+      label: "CodeWhale",
+      hidden: true,
+      models: [],
+    });
+    expect(buildSelectableProviderSelectorProviders([hidden])).toEqual([]);
+    expect(
+      buildSelectableProviderSelectorProviders([hidden], true, { includeHidden: true }),
+    ).toHaveLength(1);
+  });
+
   it("surfaces non-ready providers with their state-specific selection", () => {
     expect(
       buildSelectableProviderSelectorProviders([

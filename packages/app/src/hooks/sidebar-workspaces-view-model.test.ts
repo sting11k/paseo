@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
 import type { WorkspaceStructureProject } from "@/projects/workspace-structure";
 import { buildWorkspaceAgentActivityIndex } from "@/utils/workspace-agent-activity";
+import { buildRelatedAgentActivityIndex } from "@/workspace-status/laneworks-related-activity";
 import {
   appendMissingOrderKeys,
   applyStoredOrdering,
@@ -151,6 +152,7 @@ function workspace(input: {
   projectDisplayName: string;
   status?: WorkspaceDescriptor["status"];
   statusEnteredAt?: Date | null;
+  background?: boolean;
 }): WorkspaceDescriptor {
   return {
     createdAt: null,
@@ -165,6 +167,7 @@ function workspace(input: {
     name: input.name,
     status: input.status ?? "done",
     statusEnteredAt: input.statusEnteredAt ?? null,
+    ...(input.background === undefined ? {} : { background: input.background }),
     archivingAt: null,
     diffStat: null,
     scripts: [],
@@ -327,6 +330,7 @@ describe("shared sidebar workspace model", () => {
         {
           serverId: "host-a",
           workspaceAgentActivity: new Map(),
+          relatedAgentActivity: new Map(),
           workspaces: new Map([
             [
               "main",
@@ -343,6 +347,7 @@ describe("shared sidebar workspace model", () => {
         {
           serverId: "host-b",
           workspaceAgentActivity: new Map(),
+          relatedAgentActivity: new Map(),
           workspaces: new Map([
             [
               "feature",
@@ -428,6 +433,7 @@ describe("shared sidebar workspace model", () => {
       {
         serverId: "srv",
         workspaceAgentActivity: new Map(),
+        relatedAgentActivity: new Map(),
         workspaces: new Map([
           ["one", one],
           ["two", two],
@@ -481,6 +487,7 @@ describe("shared sidebar workspace model", () => {
         {
           serverId: "srv",
           workspaceAgentActivity: new Map(),
+          relatedAgentActivity: new Map(),
           workspaces: new Map([
             ["one", one],
             ["two", two],
@@ -494,6 +501,7 @@ describe("shared sidebar workspace model", () => {
         {
           serverId: "srv",
           workspaceAgentActivity: new Map(),
+          relatedAgentActivity: new Map(),
           workspaces: new Map([
             ["one", one],
             ["two", { ...two, status: "running" }],
@@ -518,6 +526,7 @@ describe("shared sidebar workspace model", () => {
         {
           serverId: "srv",
           workspaceAgentActivity: new Map(),
+          relatedAgentActivity: new Map(),
           workspaces: new Map([
             [
               "clone-a",
@@ -721,6 +730,7 @@ function agent(input: {
   updatedAt?: Date;
   parentAgentId?: string | null;
   archivedAt?: Date | null;
+  labels?: Record<string, string>;
 }): Agent {
   return {
     serverId: "srv",
@@ -746,7 +756,7 @@ function agent(input: {
     model: null,
     parentAgentId: input.parentAgentId ?? null,
     archivedAt: input.archivedAt ?? null,
-    labels: {},
+    labels: input.labels ?? {},
   };
 }
 
@@ -754,11 +764,11 @@ function sessionWith(input: {
   workspaces: WorkspaceDescriptor[];
   agents?: Agent[];
 }): ProjectStatusSession {
+  const agents = new Map((input.agents ?? []).map((entry) => [entry.id, entry]));
   return {
     workspaces: new Map(input.workspaces.map((entry) => [entry.id, entry])),
-    workspaceAgentActivity: buildWorkspaceAgentActivityIndex(
-      new Map((input.agents ?? []).map((entry) => [entry.id, entry])),
-    ),
+    workspaceAgentActivity: buildWorkspaceAgentActivityIndex(agents),
+    relatedAgentActivity: buildRelatedAgentActivityIndex(agents),
   };
 }
 
@@ -966,6 +976,169 @@ describe("deriveProjectStatusBucket", () => {
         },
       }),
     ).toBe("done");
+  });
+});
+
+describe("Laneworks Supervisor row", () => {
+  function laneworksAgent(input: {
+    id: string;
+    role: string;
+    workspaceId: string;
+    status: Agent["status"];
+    project?: string;
+  }): Agent {
+    return agent({
+      id: input.id,
+      workspaceId: input.workspaceId,
+      status: input.status,
+      labels: { "laneworks.project": input.project ?? "proj-a", "laneworks.role": input.role },
+    });
+  }
+
+  function supervisorWorkspace(status: WorkspaceDescriptor["status"]): WorkspaceDescriptor {
+    return workspace({
+      id: "ws-supervisor",
+      name: "main",
+      projectId: "project-a",
+      projectDisplayName: "project-a",
+      status,
+    });
+  }
+
+  function seatWorkspace(status: WorkspaceDescriptor["status"]): WorkspaceDescriptor {
+    return workspace({
+      id: "ws-lead",
+      name: "lead-copy",
+      projectId: "project-a",
+      projectDisplayName: "project-a",
+      status,
+      background: true,
+    });
+  }
+
+  function idleSupervisor(): Agent {
+    return laneworksAgent({
+      id: "supervisor",
+      role: "supervisor",
+      workspaceId: "ws-supervisor",
+      status: "idle",
+    });
+  }
+
+  function sidebarRows(input: { seatStatus: Agent["status"] }) {
+    const session = sessionWith({
+      workspaces: [
+        supervisorWorkspace("done"),
+        seatWorkspace(input.seatStatus === "running" ? "running" : "done"),
+      ],
+      agents: [
+        idleSupervisor(),
+        laneworksAgent({
+          id: "lead",
+          role: "lead",
+          workspaceId: "ws-lead",
+          status: input.seatStatus,
+        }),
+      ],
+    });
+    const entries = buildSidebarWorkspaceEntries({
+      placements: [
+        workspacePlacement({ workspaceId: "ws-supervisor" }),
+        workspacePlacement({ workspaceId: "ws-lead" }),
+      ],
+      sessions: [{ serverId: "srv", ...session }],
+    });
+    // The sidebar's default view hides background workspaces by their own flag.
+    const visible = [...entries.values()].filter((entry) => !entry.background);
+    return { entries, visible };
+  }
+
+  function supervisorStatus(input: {
+    supervisorStatus: WorkspaceDescriptor["status"];
+    seat: Agent;
+  }): { row: WorkspaceDescriptor["status"]; header: WorkspaceDescriptor["status"] } {
+    const session = sessionWith({
+      workspaces: [supervisorWorkspace(input.supervisorStatus), seatWorkspace("running")],
+      agents: [idleSupervisor(), input.seat],
+    });
+    const row = createSidebarWorkspaceEntry({
+      serverId: "srv",
+      workspace: supervisorWorkspace(input.supervisorStatus),
+      workspaceAgentActivity: session.workspaceAgentActivity,
+      relatedAgentActivity: session.relatedAgentActivity,
+    });
+    const header = deriveProjectStatusBucket({
+      workspaces: [workspacePlacement({ workspaceId: "ws-supervisor" })],
+      sessions: { srv: session },
+    });
+    return { row: row.statusBucket, header };
+  }
+
+  it("shows a hidden seat's start and end on the Supervisor row without adding rows", () => {
+    const running = sidebarRows({ seatStatus: "running" });
+    const stopped = sidebarRows({ seatStatus: "idle" });
+
+    expect(running.visible.map((entry) => [entry.workspaceId, entry.statusBucket])).toEqual([
+      ["ws-supervisor", "running"],
+    ]);
+    expect(stopped.visible.map((entry) => [entry.workspaceId, entry.statusBucket])).toEqual([
+      ["ws-supervisor", "done"],
+    ]);
+    expect(
+      [...running.entries.values()].map((entry) => [entry.workspaceId, entry.background]),
+    ).toEqual([
+      ["ws-supervisor", undefined],
+      ["ws-lead", true],
+    ]);
+  });
+
+  it.each(["needs_input", "failed"] as const)(
+    "keeps the Supervisor's %s above seat activity on the row and the project header",
+    (status) => {
+      expect(
+        supervisorStatus({
+          supervisorStatus: status,
+          seat: laneworksAgent({
+            id: "lead",
+            role: "lead",
+            workspaceId: "ws-lead",
+            status: "running",
+          }),
+        }),
+      ).toEqual({ row: status, header: status });
+    },
+  );
+
+  it.each(["done", "attention"] as const)(
+    "raises a %s Supervisor row and project header to running while a seat runs",
+    (status) => {
+      expect(
+        supervisorStatus({
+          supervisorStatus: status,
+          seat: laneworksAgent({
+            id: "peer",
+            role: "peer",
+            workspaceId: "ws-lead",
+            status: "running",
+          }),
+        }),
+      ).toEqual({ row: "running", header: "running" });
+    },
+  );
+
+  it("leaves the row alone for a seat of another project", () => {
+    expect(
+      supervisorStatus({
+        supervisorStatus: "done",
+        seat: laneworksAgent({
+          id: "lead",
+          role: "lead",
+          workspaceId: "ws-lead",
+          status: "running",
+          project: "proj-b",
+        }),
+      }),
+    ).toEqual({ row: "done", header: "done" });
   });
 });
 

@@ -56,6 +56,10 @@ import {
   type WorkspaceAgentActivity,
 } from "@/utils/workspace-agent-activity";
 import {
+  buildRelatedAgentActivityIndex,
+  type RelatedAgentActivity,
+} from "@/workspace-status/laneworks-related-activity";
+import {
   resolveTimelineTurnPresentation,
   resolveTurnPresentation,
   TURN_LIVENESS_IDLE,
@@ -503,6 +507,7 @@ export interface SessionState {
   // Agents
   agents: Map<string, Agent>;
   workspaceAgentActivity: Map<string, WorkspaceAgentActivity>;
+  relatedAgentActivity: Map<string, RelatedAgentActivity>;
   agentDetails: Map<string, Agent>;
   workspaces: Map<string, WorkspaceDescriptor>;
   // All active project descriptors, keyed by host-local projectId.
@@ -754,6 +759,7 @@ function createInitialSessionState(
     initializingAgents: new Map(),
     agents: new Map(),
     workspaceAgentActivity: new Map(),
+    relatedAgentActivity: new Map(),
     agentDetails: new Map(),
     workspaces: new Map(),
     projects: new Map(),
@@ -1619,6 +1625,10 @@ export const useSessionStore = create<SessionStore>()(
                 workspaceAgentActivity: buildWorkspaceAgentActivityIndex(
                   nextAgents,
                   session.workspaceAgentActivity,
+                ),
+                relatedAgentActivity: buildRelatedAgentActivityIndex(
+                  nextAgents,
+                  session.relatedAgentActivity,
                 ),
               },
             },

@@ -352,6 +352,51 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("listUsageLaunches keys each enabled configured env by the provider it extends", () => {
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      providerOverrides: {
+        "claude-max": {
+          extends: "claude",
+          label: "Claude Max",
+          env: { CLAUDE_CONFIG_DIR: "/tmp/claude-max" },
+        },
+        "claude-max-lead": {
+          extends: "claude",
+          label: "Claude Max Lead",
+          env: { CLAUDE_CONFIG_DIR: "/tmp/claude-max", ROLE: "lead" },
+        },
+        codex: { env: { CODEX_HOME: "/tmp/codex" } },
+        "claude-off": {
+          extends: "claude",
+          label: "Off",
+          env: { CLAUDE_CONFIG_DIR: "/tmp/claude-off" },
+          enabled: false,
+        },
+        "qwen-codex": { extends: "codex", label: "Qwen Code" },
+      },
+    });
+    try {
+      const launches = manager.listUsageLaunches();
+      expect(
+        launches.map(({ provider, env }) => [
+          provider,
+          provider === "codex" ? env.CODEX_HOME : env.CLAUDE_CONFIG_DIR,
+          env.ROLE,
+        ]),
+      ).toEqual([
+        ["codex", "/tmp/codex", undefined],
+        ["claude", "/tmp/claude-max", undefined],
+        ["claude", "/tmp/claude-max", "lead"],
+        // Inherited from the configured codex env.
+        ["codex", "/tmp/codex", undefined],
+      ]);
+      expect(launches[0]?.env.PATH).toBe(process.env.PATH);
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("getProviderLabel returns the override label when provided", () => {
     const manager = new ProviderSnapshotManager({
       logger: createTestLogger(),

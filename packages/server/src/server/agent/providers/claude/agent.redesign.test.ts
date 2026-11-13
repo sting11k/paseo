@@ -1,11 +1,15 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Logger } from "pino";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import { asInternals } from "../../../test-utils/class-mocks.js";
 import { ClaudeAgentClient, readEventIdentifiers } from "./agent.js";
+import { AgentRunState } from "../../agent-run-state.js";
 import { streamSession } from "../test-utils/session-stream-adapter.js";
-import type { AgentStreamEvent, AgentTimelineItem } from "../../agent-sdk-types.js";
+import type { AgentSession, AgentStreamEvent, AgentTimelineItem } from "../../agent-sdk-types.js";
 
 interface QueryMock {
   next: ReturnType<typeof vi.fn>;
@@ -1179,11 +1183,101 @@ test("plan approval exposes a resume-bypass action and can return to bypassPermi
   }
 });
 
+test.each(["foreground", "autonomous"] as const)(
+  "does not reuse %s turn IDs after persisting and resuming a Claude runtime",
+  async (owner) => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "claude-turn-identity-"));
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory: sdkQueryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+      runtimeSettings: { env: { CLAUDE_CONFIG_DIR: path.join(cwd, "config") } },
+    });
+    sdkQueryFactory.mockImplementation(() => createPendingQueryMock());
+    const sessions: AgentSession[] = [];
+    const launchContext = { agentId: "same-paseo-agent" };
+    try {
+      const first = await client.createSession({ provider: "claude", cwd }, launchContext);
+      sessions.push(first);
+      const firstEvents: AgentStreamEvent[] = [];
+      first.subscribe((event) => firstEvents.push(event));
+      const firstInternal: SessionStateInternals = asInternals(first);
+      const query = createPendingQueryMock();
+      const firstForeground = await first.startTurn("before collection");
+      await firstInternal.routeSdkMessageFromPump(claudeTurnInit(), query);
+      await firstInternal.routeSdkMessageFromPump(successResult(), query);
+      let oldTurnId = firstForeground.turnId;
+      if (owner === "autonomous") {
+        await firstInternal.routeSdkMessageFromPump(claudeTurnInit(), query);
+        oldTurnId = firstInternal.autonomousTurn!.id;
+        await firstInternal.routeSdkMessageFromPump(successResult(), query);
+      }
+      const handle = first.describePersistence();
+      expect(handle).toMatchObject({ provider: "claude", sessionId: "sess-1" });
+      const persistencePath = path.join(cwd, "handle.json");
+      await writeFile(persistencePath, JSON.stringify(handle));
+      await first.close();
+      const second = await client.resumeSession(
+        JSON.parse(await readFile(persistencePath, "utf8")),
+        undefined,
+        launchContext,
+      );
+      sessions.push(second);
+      expect(second).not.toBe(first);
+      expect(second.describePersistence()).toEqual(handle);
+      const secondEvents: AgentStreamEvent[] = [];
+      second.subscribe((event) => secondEvents.push(event));
+      const secondInternal: SessionStateInternals = asInternals(second);
+      const secondForeground = await second.startTurn("after collection");
+      await secondInternal.routeSdkMessageFromPump(claudeTurnInit(), query);
+      let newTurnId = secondForeground.turnId;
+      if (owner === "autonomous") {
+        await secondInternal.routeSdkMessageFromPump(successResult(), query);
+        await secondInternal.routeSdkMessageFromPump(claudeTurnInit(), query);
+        newTurnId = secondInternal.autonomousTurn!.id;
+      }
+      expect(newTurnId).not.toBe(oldTurnId);
+      // The daemon must keep the resumed run when an old terminal arrives late.
+      const runs = new AgentRunState();
+      if (owner === "foreground") {
+        runs.settleForegroundStart(runs.createPendingRun(launchContext.agentId), {
+          status: "started",
+          turnId: newTurnId,
+        });
+      } else {
+        runs.trackAutonomousRun(launchContext.agentId, newTurnId);
+      }
+      runs.settleTerminalRun(launchContext.agentId, oldTurnId);
+      expect(runs.getTurnId(launchContext.agentId)).toBe(newTurnId);
+      await secondInternal.routeSdkMessageFromPump(successResult(), query);
+      for (const [events, turnId] of [
+        [firstEvents, oldTurnId],
+        [secondEvents, newTurnId],
+      ] as const) {
+        expect(
+          events.filter(
+            (event) =>
+              event.turnId === turnId &&
+              (event.type === "turn_started" || event.type === "turn_completed"),
+          ),
+        ).toEqual([
+          { type: "turn_started", provider: "claude", turnId },
+          expect.objectContaining({ type: "turn_completed", provider: "claude", turnId }),
+        ]);
+      }
+      runs.settleTerminalRun(launchContext.agentId, newTurnId);
+      expect(runs.hasRun(launchContext.agentId)).toBe(false);
+    } finally {
+      for (const session of sessions) await session.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
 test("reuses one autonomous run for unbound stream_event bursts with no foreground run", async () => {
   const session = await createSession();
   const internal: {
     turnState: "idle" | "foreground" | "autonomous";
-    nextTurnOrdinal: number;
     routeSdkMessageFromPump: (
       message: Record<string, unknown>,
       activeQuery: QueryMock,
@@ -1206,8 +1300,7 @@ test("reuses one autonomous run for unbound stream_event bursts with no foregrou
   );
 
   const firstRunId = internal.autonomousTurn?.id ?? null;
-  expect(firstRunId).toBe("autonomous-turn-1");
-  expect(internal.nextTurnOrdinal).toBe(2);
+  expect(firstRunId).toEqual(expect.stringMatching(/^autonomous-turn-/));
 
   await internal.routeSdkMessageFromPump(
     {
@@ -1220,7 +1313,6 @@ test("reuses one autonomous run for unbound stream_event bursts with no foregrou
     queryMock,
   );
   expect(internal.autonomousTurn?.id).toBe(firstRunId);
-  expect(internal.nextTurnOrdinal).toBe(2);
 
   await internal.routeSdkMessageFromPump(
     {
@@ -1360,7 +1452,7 @@ test("a main-session frame opens no turn until Claude starts one", async () => {
   // session start a turn of its own, with no prompt from the user.
   await internal.routeSdkMessageFromPump(claudeTurnInit(), queryMock);
   await internal.routeSdkMessageFromPump(unboundTextDelta("picking this up"), queryMock);
-  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-1");
+  expect(internal.autonomousTurn?.id).toEqual(expect.stringMatching(/^autonomous-turn-/));
 
   await internal.routeSdkMessageFromPump(successResult(), queryMock);
   expect(internal.autonomousTurn).toBeNull();
@@ -1410,7 +1502,7 @@ test("Claude waking up after a helper finishes gets an autonomous turn that its 
   expect(internal.autonomousTurn).toBeNull();
 
   await internal.routeSdkMessageFromPump(claudeTurnInit(), queryMock);
-  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-1");
+  expect(internal.autonomousTurn?.id).toEqual(expect.stringMatching(/^autonomous-turn-/));
   expect(internal.turnState).toBe("autonomous");
 
   await internal.routeSdkMessageFromPump(unboundTextDelta("the helper is done"), queryMock);
@@ -1446,7 +1538,8 @@ test("a steer folded into a turn keeps one turn, and a turn Claude starts after 
 
   // A message that arrived while Claude wrote its final answer runs as a turn of its own.
   await internal.routeSdkMessageFromPump(claudeTurnInit(), queryMock);
-  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-2");
+  expect(internal.autonomousTurn?.id).toEqual(expect.stringMatching(/^autonomous-turn-/));
+  expect(internal.autonomousTurn?.id).not.toBe(turnId);
   await internal.routeSdkMessageFromPump(successResult(), queryMock);
   expect(internal.autonomousTurn).toBeNull();
   expect(internal.turnState).toBe("idle");
@@ -1483,7 +1576,7 @@ test("an idle session state closes an autonomous turn that no result closed", as
   session.subscribe((event) => events.push(event));
 
   await internal.routeSdkMessageFromPump(claudeTurnInit(), queryMock);
-  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-1");
+  expect(internal.autonomousTurn?.id).toEqual(expect.stringMatching(/^autonomous-turn-/));
 
   // Safety net: Claude says nothing at all is running any more.
   await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
@@ -1685,7 +1778,7 @@ test("a new turn clears an interrupt flag no result will consume", async () => {
 
   await internal.routeSdkMessageFromPump(claudeTurnInit(), queryMock);
   expect(internal.pendingInterruptAbort).toBe(false);
-  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-1");
+  expect(internal.autonomousTurn?.id).toEqual(expect.stringMatching(/^autonomous-turn-/));
 
   // This turn's own failure is reported, not swallowed as the interrupted turn's leftover.
   await internal.routeSdkMessageFromPump(
@@ -2057,6 +2150,389 @@ test("does not use stream_event uuid as assistant message identity when message_
     timelineAssembler: { messages: Map<string, unknown> };
   } = asInternals(session);
   expect(assembler.timelineAssembler.messages.size).toBe(0);
+
+  await session.close();
+});
+
+// The SDK contract: while a response streams, Claude Code sends one `assistant` frame per
+// completed content block, in content-block order and counting every block type, all sharing
+// message.id. Each frame lands after its block's deltas and before its content_block_stop.
+function mockScriptedTurn(frames: Record<string, unknown>[]): void {
+  sdkQueryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    const readPromptUuid = createPromptUuidReader(prompt);
+    const script: Array<() => Promise<Record<string, unknown>>> = [
+      async () => ({
+        type: "system",
+        subtype: "init",
+        session_id: "multi-block-session",
+        permissionMode: "default",
+        model: "opus",
+      }),
+      async () => ({
+        type: "user",
+        message: { role: "user", content: "multi-block prompt" },
+        parent_tool_use_id: null,
+        uuid: (await readPromptUuid()) ?? "missing-prompt-uuid",
+        session_id: "multi-block-session",
+      }),
+      ...frames.map((frame) => async () => frame),
+      async () => successResult(),
+    ];
+    let step = 0;
+    return createBaseQueryMock(
+      vi.fn(async () => {
+        const next = script[step];
+        step += 1;
+        return next ? { done: false, value: await next() } : { done: true, value: undefined };
+      }),
+    );
+  });
+}
+
+const MULTI_BLOCK_MESSAGE_ID = "msg_multi_block";
+
+type ScriptBlock =
+  | { type: "thinking"; thinking: string; signature: string }
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
+
+function streamEventFrame(
+  event: Record<string, unknown>,
+  messageId = MULTI_BLOCK_MESSAGE_ID,
+): Record<string, unknown> {
+  return {
+    type: "stream_event",
+    parent_tool_use_id: null,
+    event: { message_id: messageId, ...event },
+  };
+}
+
+function messageStartFrame(messageId = MULTI_BLOCK_MESSAGE_ID): Record<string, unknown> {
+  return streamEventFrame(
+    { type: "message_start", message: { id: messageId, role: "assistant", model: "opus" } },
+    messageId,
+  );
+}
+
+function messageStopFrame(messageId = MULTI_BLOCK_MESSAGE_ID): Record<string, unknown> {
+  return streamEventFrame({ type: "message_stop" }, messageId);
+}
+
+function assistantFrame(
+  content: ScriptBlock[],
+  messageId = MULTI_BLOCK_MESSAGE_ID,
+): Record<string, unknown> {
+  return {
+    type: "assistant",
+    message: { id: messageId, role: "assistant", model: "opus", content, stop_reason: null },
+    parent_tool_use_id: null,
+  };
+}
+
+function thinkingBlock(value: string): ScriptBlock {
+  return { type: "thinking", thinking: value, signature: "sig" };
+}
+
+function textBlock(value: string): ScriptBlock {
+  return { type: "text", text: value };
+}
+
+function toolUseBlock(id: string): ScriptBlock {
+  return { type: "tool_use", id, name: "Bash", input: { command: "ls" } };
+}
+
+function deltaFor(block: ScriptBlock, chunk: string): Record<string, unknown> {
+  return block.type === "thinking"
+    ? { type: "thinking_delta", thinking: chunk }
+    : { type: "text_delta", text: chunk };
+}
+
+function emptyStartFor(block: ScriptBlock): Record<string, unknown> {
+  if (block.type === "thinking") {
+    return { type: "thinking", thinking: "", signature: "" };
+  }
+  if (block.type === "text") {
+    return { type: "text", text: "" };
+  }
+  return { type: "tool_use", id: block.id, name: block.name, input: {} };
+}
+
+/**
+ * One content block the way Claude Code streams it: start, deltas, the completed block as
+ * its own `assistant` frame, then stop.
+ */
+function streamedBlock(
+  index: number,
+  block: ScriptBlock,
+  chunks: string[],
+  messageId = MULTI_BLOCK_MESSAGE_ID,
+): Record<string, unknown>[] {
+  return [
+    streamEventFrame(
+      { type: "content_block_start", index, content_block: emptyStartFor(block) },
+      messageId,
+    ),
+    ...chunks.map((chunk) =>
+      streamEventFrame(
+        { type: "content_block_delta", index, delta: deltaFor(block, chunk) },
+        messageId,
+      ),
+    ),
+    assistantFrame([block], messageId),
+    streamEventFrame({ type: "content_block_stop", index }, messageId),
+  ];
+}
+
+function textItems(events: AgentStreamEvent[]): { type: string; text: string }[] {
+  return events.flatMap((event) =>
+    event.type === "timeline" &&
+    (event.item.type === "reasoning" || event.item.type === "assistant_message")
+      ? [{ type: event.item.type, text: event.item.text }]
+      : [],
+  );
+}
+
+async function collectTextTimeline(): Promise<{ type: string; text: string }[]> {
+  const session = await createSession();
+  const events = await collectUntilTerminal(streamSession(session, "multi-block prompt"));
+  await session.close();
+  return textItems(events);
+}
+
+function joinTimelineText(items: { type: string; text: string }[], type: string): string {
+  return items
+    .filter((item) => item.type === type)
+    .map((item) => item.text)
+    .join("");
+}
+
+test("emits two streamed thinking blocks and a tool call once each (production repro)", async () => {
+  mockScriptedTurn([
+    messageStartFrame(),
+    ...streamedBlock(0, thinkingBlock("First thought."), ["First ", "thought."]),
+    ...streamedBlock(1, thinkingBlock("Second thought."), ["Second ", "thought."]),
+    ...streamedBlock(2, toolUseBlock("toolu_repro"), []),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "reasoning")).toBe("First thought.Second thought.");
+});
+
+test("emits two streamed text blocks once each", async () => {
+  mockScriptedTurn([
+    messageStartFrame(),
+    ...streamedBlock(0, textBlock("Hello there."), ["Hello ", "there."]),
+    ...streamedBlock(1, textBlock(" General Kenobi."), [" General ", "Kenobi."]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "assistant_message")).toBe("Hello there. General Kenobi.");
+});
+
+test("emits each thinking block once when Claude sends block snapshots without streaming", async () => {
+  mockScriptedTurn([
+    assistantFrame([thinkingBlock("First thought.")]),
+    assistantFrame([thinkingBlock("Second thought.")]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "reasoning")).toBe("First thought.Second thought.");
+});
+
+test("emits each text block once when Claude sends block snapshots without streaming", async () => {
+  mockScriptedTurn([
+    assistantFrame([textBlock("Hello there.")]),
+    assistantFrame([textBlock(" General Kenobi.")]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "assistant_message")).toBe("Hello there. General Kenobi.");
+});
+
+test("emits a block snapshot whole even when it starts with the previous block's text", async () => {
+  mockScriptedTurn([
+    assistantFrame([textBlock("A")]),
+    assistantFrame([textBlock("AB")]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "assistant_message")).toBe("AAB");
+});
+
+test("keeps snapshot blocks apart across thinking and tool calls", async () => {
+  mockScriptedTurn([
+    assistantFrame([textBlock("A")]),
+    assistantFrame([thinkingBlock("Plan")]),
+    assistantFrame([toolUseBlock("toolu_between")]),
+    assistantFrame([textBlock("AB")]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(items).toEqual([
+    { type: "assistant_message", text: "A" },
+    { type: "reasoning", text: "Plan" },
+    { type: "assistant_message", text: "AB" },
+  ]);
+});
+
+test("emits a streamed block that starts with the previous block's text once", async () => {
+  mockScriptedTurn([
+    messageStartFrame(),
+    ...streamedBlock(0, thinkingBlock("A"), ["A"]),
+    ...streamedBlock(1, thinkingBlock("AB"), ["A", "B"]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "reasoning")).toBe("AAB");
+});
+
+test.each([
+  [
+    "streamed",
+    [
+      messageStartFrame(),
+      ...streamedBlock(0, thinkingBlock("Same."), ["Same."]),
+      ...streamedBlock(1, thinkingBlock("Same."), ["Same."]),
+      messageStopFrame(),
+    ],
+  ],
+  [
+    "snapshots only",
+    [
+      assistantFrame([thinkingBlock("Same.")]),
+      assistantFrame([thinkingBlock("Same.")]),
+      messageStopFrame(),
+    ],
+  ],
+])("emits two blocks with identical text once per block (%s)", async (_label, frames) => {
+  mockScriptedTurn(frames);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "reasoning")).toBe("Same.Same.");
+});
+
+test("emits the rest of a block when its snapshot extends the streamed text", async () => {
+  mockScriptedTurn([
+    messageStartFrame(),
+    ...streamedBlock(0, thinkingBlock("Partial thought."), ["Partial"]),
+    ...streamedBlock(1, textBlock("Answer."), ["Answer"]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "reasoning")).toBe("Partial thought.");
+  expect(joinTimelineText(items, "assistant_message")).toBe("Answer.");
+});
+
+test("keeps block order for interleaved streamed thinking, text, and tool calls", async () => {
+  mockScriptedTurn([
+    messageStartFrame(),
+    ...streamedBlock(0, thinkingBlock("Plan A."), ["Plan ", "A."]),
+    ...streamedBlock(1, textBlock("Running it."), ["Running ", "it."]),
+    ...streamedBlock(2, toolUseBlock("toolu_interleaved_1"), []),
+    ...streamedBlock(3, thinkingBlock("Plan B."), ["Plan ", "B."]),
+    ...streamedBlock(4, toolUseBlock("toolu_interleaved_2"), []),
+    ...streamedBlock(5, textBlock("Done."), ["Done."]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(items).toEqual([
+    { type: "reasoning", text: "Plan " },
+    { type: "reasoning", text: "A." },
+    { type: "assistant_message", text: "Running " },
+    { type: "assistant_message", text: "it." },
+    { type: "reasoning", text: "Plan " },
+    { type: "reasoning", text: "B." },
+    { type: "assistant_message", text: "Done." },
+  ]);
+});
+
+test("emits each block once when index-free deltas are followed by block snapshots", async () => {
+  // Off-contract: the SDK always sends `index`. Kept to pin the open-block fallback.
+  const unindexed = (chunk: string) =>
+    streamEventFrame({
+      type: "content_block_delta",
+      delta: { type: "thinking_delta", thinking: chunk },
+    });
+  mockScriptedTurn([
+    messageStartFrame(),
+    unindexed("First."),
+    assistantFrame([thinkingBlock("First.")]),
+    unindexed("Second."),
+    assistantFrame([thinkingBlock("Second.")]),
+    messageStopFrame(),
+  ]);
+
+  const items = await collectTextTimeline();
+
+  expect(joinTimelineText(items, "reasoning")).toBe("First.Second.");
+});
+
+test("an interrupt mid-block leaves the partial block once and the next message starts fresh", async () => {
+  const queryMock = createInterruptibleQueryMock();
+  sdkQueryFactory.mockImplementation(() => queryMock);
+  const session = await createSession();
+  const internal: InterruptInternals = asInternals(session);
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+
+  await session.startTurn("long task");
+  const promptUuid = await readFirstPromptUuid();
+  await internal.routeSdkMessageFromPump(commandLifecycle(promptUuid ?? "", "started"), queryMock);
+  await internal.routeSdkMessageFromPump(claudeTurnInit(), queryMock);
+  const interrupted = "msg_interrupted";
+  for (const frame of [
+    messageStartFrame(interrupted),
+    ...streamedBlock(0, thinkingBlock("Done thinking."), ["Done ", "thinking."], interrupted),
+    streamEventFrame(
+      { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+      interrupted,
+    ),
+    streamEventFrame(
+      { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Half an an" } },
+      interrupted,
+    ),
+  ]) {
+    await internal.routeSdkMessageFromPump(frame, queryMock);
+  }
+
+  await session.interrupt();
+  await vi.waitFor(() => expect(queryMock.interrupt).toHaveBeenCalledTimes(1));
+  await internal.routeSdkMessageFromPump(abortedResult(), queryMock);
+
+  await session.startTurn("next");
+  await internal.routeSdkMessageFromPump(claudeTurnInit(), queryMock);
+  const next = "msg_after_interrupt";
+  for (const frame of [
+    messageStartFrame(next),
+    ...streamedBlock(0, textBlock("Fresh answer."), ["Fresh ", "answer."], next),
+    messageStopFrame(next),
+  ]) {
+    await internal.routeSdkMessageFromPump(frame, queryMock);
+  }
+  await internal.routeSdkMessageFromPump(successResult(), queryMock);
+
+  const items = textItems(events);
+  expect(joinTimelineText(items, "reasoning")).toBe("Done thinking.");
+  expect(joinTimelineText(items, "assistant_message")).toBe("Half an anFresh answer.");
 
   await session.close();
 });

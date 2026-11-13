@@ -1,3 +1,4 @@
+import { continuesTimelineTurn } from "../../../../../protocol/src/timeline-turn.js";
 import { describe, expect, test, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -9,6 +10,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type {
+  AgentPersistenceHandle,
   AgentClient,
   AgentLaunchContext,
   AgentPermissionRequest,
@@ -4611,7 +4613,7 @@ describe("Codex app-server provider", () => {
       await expect(child).resolves.toMatchObject({
         type: "provider_subagent",
         provider: "codex",
-        turnId: "codex-turn-0",
+        turnId: expect.stringMatching(/^codex-turn-[0-9a-f-]{36}$/),
         event: {
           type: "upsert",
           id: "legacy-only-child-thread",
@@ -4621,7 +4623,7 @@ describe("Codex app-server provider", () => {
       await expect(spawn).resolves.toMatchObject({
         type: "timeline",
         provider: "codex",
-        turnId: "codex-turn-0",
+        turnId: expect.stringMatching(/^codex-turn-[0-9a-f-]{36}$/),
         item: {
           type: "tool_call",
           callId: "spawn-legacy-only-child",
@@ -7826,5 +7828,49 @@ test("publishes a materialized image before dispatching the following turn compl
     expect(existsSync(markdownImageSource(imageEvent.item.text))).toBe(true);
   } finally {
     await session.close();
+  }
+});
+
+test("Codex gives resumed turns distinct canonical IDs", async () => {
+  const logger = createTestLogger();
+  const cwd = await mkdtemp(path.join(tmpdir(), "paseo-codex-ordinal-audit-"));
+  const ids: string[] = [];
+  let handle: AgentPersistenceHandle | null = null;
+  try {
+    for (const nativeId of ["native-before", "native-after"]) {
+      const app = createFakeCodexAppServer({
+        "thread/backgroundTerminals/list": () => ({ data: [], nextCursor: null }),
+      });
+      const session = new CodexAppServerAgentSession(
+        { provider: "codex", cwd },
+        handle,
+        logger,
+        async () => app.child,
+      );
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      try {
+        const turn = await session.startTurn("hello");
+        app.startsTurn({ threadId: "thread-1", turnId: nativeId });
+        await expect
+          .poll(() => events.filter((event) => event.type === "turn_started").length)
+          .toBe(1);
+        expect(events.find((event) => event.type === "turn_started")).toMatchObject({
+          turnId: turn.turnId,
+        });
+        ids.push(turn.turnId);
+        app.completeTurn({ threadId: "thread-1" });
+        await expect.poll(() => session.canStopRuntime()).toBe(true);
+        handle = session.describePersistence();
+        expect(handle?.sessionId).toBe("thread-1");
+        app.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    }
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(continuesTimelineTurn(ids[0], ids[1], true)).toBe(false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });

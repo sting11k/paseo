@@ -1226,12 +1226,25 @@ interface TimelineFragment {
   text: string;
 }
 
+interface TimelineBlockState {
+  kind: TimelineFragment["kind"];
+  text: string;
+  emittedLength: number;
+}
+
+// Block identity is positional, per the Claude Agent SDK contract (SDKAssistantMessage docs):
+// while a response streams, the CLI emits one `assistant` frame per completed content block, in
+// content-block order and counting every block type, all sharing message.id. So the k-th block
+// delivered by a message's `assistant` frames is content-block index k, the same index its
+// `stream_event` content_block_* frames carry.
 interface TimelineMessageState {
   id: string;
-  assistantText: string;
-  reasoningText: string;
-  emittedAssistantLength: number;
-  emittedReasoningLength: number;
+  // Keyed by content-block index.
+  blocks: Map<number, TimelineBlockState>;
+  // Blocks delivered by `assistant` frames so far, which is the index of the next one.
+  snapshotBlockCount: number;
+  // The block started but not yet stopped or delivered; index-free deltas append to it.
+  openBlockIndex: number | null;
   stopped: boolean;
 }
 
@@ -1271,8 +1284,7 @@ class TimelineAssembler {
       return [];
     }
     const state = this.ensureMessageState(messageId, runId);
-    const fragments = this.extractFragments(message.message?.content);
-    return this.applyAbsoluteFragments(state, fragments);
+    return this.applySnapshot(state, message.message?.content);
   }
 
   private consumeStreamEvent(
@@ -1309,19 +1321,53 @@ class TimelineAssembler {
       return this.finalizeMessage(messageId, runId);
     }
 
+    const blockIndex = typeof event.index === "number" ? event.index : null;
+
     if (eventType === "content_block_start") {
-      return this.consumeDeltaContent(event.content_block, runId, streamEventMessageId);
+      this.openStreamBlock(blockIndex, runId, streamEventMessageId);
+      return this.consumeDeltaContent(event.content_block, blockIndex, runId, streamEventMessageId);
     }
 
     if (eventType === "content_block_delta") {
-      return this.consumeDeltaContent(event.delta, runId, streamEventMessageId);
+      return this.consumeDeltaContent(event.delta, blockIndex, runId, streamEventMessageId);
+    }
+
+    if (eventType === "content_block_stop") {
+      const state = this.findMessageState(runId, streamEventMessageId);
+      if (state && (blockIndex === null || state.openBlockIndex === blockIndex)) {
+        state.openBlockIndex = null;
+      }
     }
 
     return [];
   }
 
+  private findMessageState(
+    runId: string | null,
+    messageIdHint: string | null,
+  ): TimelineMessageState | undefined {
+    const messageId = this.resolveMessageId({
+      runId,
+      createIfMissing: false,
+      messageId: messageIdHint,
+    });
+    return messageId ? this.messages.get(messageId) : undefined;
+  }
+
+  private openStreamBlock(
+    blockIndex: number | null,
+    runId: string | null,
+    messageIdHint: string | null,
+  ): void {
+    const state = this.findMessageState(runId, messageIdHint);
+    if (state && blockIndex !== null) {
+      state.openBlockIndex = blockIndex;
+    }
+  }
+
   private consumeDeltaContent(
     content: unknown,
+    blockIndex: number | null,
     runId: string | null,
     messageIdHint: string | null,
   ): AgentTimelineItem[] {
@@ -1338,47 +1384,67 @@ class TimelineAssembler {
       return [];
     }
     const state = this.ensureMessageState(messageId, runId);
-    return this.appendFragments(state, fragments);
+    return this.appendFragments(state, fragments, blockIndex);
   }
 
   private appendFragments(
     state: TimelineMessageState,
     fragments: TimelineFragment[],
+    blockIndex: number | null,
   ): AgentTimelineItem[] {
     for (const fragment of fragments) {
-      if (fragment.kind === "assistant") {
-        state.assistantText += fragment.text;
+      const index = blockIndex ?? this.resolveUnindexedBlockIndex(state, fragment.kind);
+      const block = state.blocks.get(index);
+      if (block) {
+        block.text += fragment.text;
       } else {
-        state.reasoningText += fragment.text;
+        state.blocks.set(index, { kind: fragment.kind, text: fragment.text, emittedLength: 0 });
       }
     }
     return this.emitNewContent(state);
   }
 
-  private applyAbsoluteFragments(
+  // Off-contract: the SDK always sends `index` on content_block_* frames. A frame without one
+  // appends to the open block, or opens the next block when none is open or the kind changes.
+  private resolveUnindexedBlockIndex(
     state: TimelineMessageState,
-    fragments: TimelineFragment[],
-  ): AgentTimelineItem[] {
-    const assistantText = fragments
-      .filter((fragment) => fragment.kind === "assistant")
-      .map((fragment) => fragment.text)
-      .join("");
-    const reasoningText = fragments
-      .filter((fragment) => fragment.kind === "reasoning")
-      .map((fragment) => fragment.text)
-      .join("");
-
-    if (assistantText.length > 0) {
-      if (!assistantText.startsWith(state.assistantText)) {
-        state.emittedAssistantLength = 0;
-      }
-      state.assistantText = assistantText;
+    kind: TimelineFragment["kind"],
+  ): number {
+    const openIndex = state.openBlockIndex;
+    if (openIndex !== null && (state.blocks.get(openIndex)?.kind ?? kind) === kind) {
+      return openIndex;
     }
-    if (reasoningText.length > 0) {
-      if (!reasoningText.startsWith(state.reasoningText)) {
-        state.emittedReasoningLength = 0;
+    let next = state.snapshotBlockCount;
+    for (const index of state.blocks.keys()) {
+      next = Math.max(next, index + 1);
+    }
+    state.openBlockIndex = next;
+    return next;
+  }
+
+  // Each `assistant` frame delivers completed blocks at the next content-block indexes. A block
+  // that streamed emits only what streaming has not: the rest of the text when the snapshot
+  // extends it, nothing when the streamed text already covers or contradicts it. A block that
+  // did not stream emits the snapshot whole.
+  private applySnapshot(state: TimelineMessageState, content: unknown): AgentTimelineItem[] {
+    if (content === undefined || content === null) {
+      return [];
+    }
+    const blocks: unknown[] = Array.isArray(content) ? content : [content];
+    for (const block of blocks) {
+      const index = state.snapshotBlockCount;
+      state.snapshotBlockCount += 1;
+      if (state.openBlockIndex === index) {
+        state.openBlockIndex = null;
       }
-      state.reasoningText = reasoningText;
+      for (const fragment of this.extractFragments(block)) {
+        const streamed = state.blocks.get(index);
+        if (!streamed) {
+          state.blocks.set(index, { kind: fragment.kind, text: fragment.text, emittedLength: 0 });
+        } else if (fragment.text.startsWith(streamed.text)) {
+          streamed.text = fragment.text;
+        }
+      }
     }
     return this.emitNewContent(state);
   }
@@ -1400,20 +1466,32 @@ class TimelineAssembler {
 
   private emitNewContent(state: TimelineMessageState): AgentTimelineItem[] {
     const items: AgentTimelineItem[] = [];
-    const nextAssistantText = state.assistantText.slice(state.emittedAssistantLength);
-    if (
-      nextAssistantText.length > 0 &&
-      nextAssistantText !== INTERRUPT_TOOL_USE_PLACEHOLDER &&
-      !isClaudeTranscriptNoiseText(nextAssistantText)
-    ) {
-      state.emittedAssistantLength = state.assistantText.length;
-      items.push({ type: "assistant_message", text: nextAssistantText, messageId: state.id });
-    }
-
-    const nextReasoningText = state.reasoningText.slice(state.emittedReasoningLength);
-    if (nextReasoningText.length > 0) {
-      state.emittedReasoningLength = state.reasoningText.length;
-      items.push({ type: "reasoning", text: nextReasoningText });
+    const blocks = [...state.blocks.entries()].sort(([left], [right]) => left - right);
+    for (const [, block] of blocks) {
+      const nextText = block.text.slice(block.emittedLength);
+      if (nextText.length === 0) {
+        continue;
+      }
+      if (block.kind === "assistant") {
+        if (nextText === INTERRUPT_TOOL_USE_PLACEHOLDER || isClaudeTranscriptNoiseText(nextText)) {
+          continue;
+        }
+        block.emittedLength = block.text.length;
+        const previous = items.at(-1);
+        if (previous?.type === "assistant_message") {
+          previous.text += nextText;
+        } else {
+          items.push({ type: "assistant_message", text: nextText, messageId: state.id });
+        }
+        continue;
+      }
+      block.emittedLength = block.text.length;
+      const previous = items.at(-1);
+      if (previous?.type === "reasoning") {
+        previous.text += nextText;
+      } else {
+        items.push({ type: "reasoning", text: nextText });
+      }
     }
     return items;
   }
@@ -1429,10 +1507,9 @@ class TimelineAssembler {
     }
     const created: TimelineMessageState = {
       id: messageId,
-      assistantText: "",
-      reasoningText: "",
-      emittedAssistantLength: 0,
-      emittedReasoningLength: 0,
+      blocks: new Map(),
+      snapshotBlockCount: 0,
+      openBlockIndex: null,
       stopped: false,
     };
     this.messages.set(messageId, created);
@@ -2371,7 +2448,6 @@ class ClaudeAgentSession implements AgentSession {
   private historySessionId: string | null = null;
   private replayingHistory = false;
   private turnState: TurnState = "idle";
-  private nextTurnOrdinal = 1;
   private cancelCurrentTurn: (() => void) | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
@@ -3933,7 +4009,8 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private createTurnId(owner: "foreground" | "autonomous"): string {
-    return `${owner}-turn-${this.nextTurnOrdinal++}`;
+    // A durable conversation can outlive this runtime (idle collection, reload, restart).
+    return `${owner}-turn-${randomUUID()}`;
   }
 
   private isTerminalTurnEvent(event: AgentStreamEvent): boolean {

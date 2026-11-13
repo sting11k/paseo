@@ -419,6 +419,84 @@ test("session discovery reuses accounts, separates launches, and retains live ag
   await expect(registry.listReports({ agentId: "one", reportIds: [] })).rejects.toThrow("agentId");
 });
 
+test("host usage lists configured launch logins before any agent runs", async () => {
+  const launches = [
+    { provider: "claude", env: { CLAUDE_CONFIG_DIR: "/max", ROLE: "lead" } },
+    { provider: "claude", env: { CLAUDE_CONFIG_DIR: "/max", ROLE: "lead" } },
+    { provider: "claude", env: { CLAUDE_CONFIG_DIR: "/max", ROLE: "peer" } },
+    { provider: "claude", env: { CLAUDE_CONFIG_DIR: "/api" } },
+  ];
+  const discoveries: string[] = [];
+  const fetched: unknown[] = [];
+  const registry = new UsageSourceRegistry(Date.now, 300_000, undefined, {
+    hasAgent: () => false,
+    usageSession: () => null,
+    usageLaunches: () => launches,
+  });
+  registry.register({
+    id: "claude",
+    label: "Claude",
+    discover: async (scope) => {
+      if (scope.kind === "global") {
+        discoveries.push("global");
+        return [{ key: "team", input: "keychain" }];
+      }
+      discoveries.push(`${scope.env.CLAUDE_CONFIG_DIR}:${scope.env.ROLE ?? ""}`);
+      // A launch without its own login contributes nothing; one sharing a login merges into it.
+      return scope.env.CLAUDE_CONFIG_DIR === "/max" ? [{ key: "max", input: "/max" }] : [];
+    },
+    fetch: async (input) => {
+      fetched.push(input);
+      return { status: "available", windows: [] };
+    },
+  });
+  expect((await registry.listReports()).map((entry) => entry.id)).toEqual([
+    "claude:team",
+    "claude:max",
+  ]);
+  expect(discoveries.sort()).toEqual(["/api:", "/max:lead", "/max:peer", "global"]);
+  expect(fetched).toEqual(["keychain", "/max"]);
+});
+
+test("host usage reuses configured launch discovery until the TTL, a forced refresh, or new config", async () => {
+  let now = 0;
+  const launches = [{ provider: "claude", env: { CLAUDE_CONFIG_DIR: "/max" } }];
+  const discoveries: string[] = [];
+  let fetches = 0;
+  const registry = new UsageSourceRegistry(() => now, 300_000, undefined, {
+    hasAgent: () => false,
+    usageSession: () => null,
+    usageLaunches: () => launches,
+  });
+  registry.register({
+    id: "claude",
+    label: "Claude",
+    discover: async (scope) => {
+      discoveries.push(scope.kind === "global" ? "global" : scope.env.CLAUDE_CONFIG_DIR);
+      return scope.kind === "global" ? [] : [{ key: "max", input: scope.env.CLAUDE_CONFIG_DIR }];
+    },
+    fetch: async () => {
+      fetches++;
+      return { status: "available", windows: [] };
+    },
+  });
+  const ids = async (options?: { forceRefresh?: boolean }) =>
+    (await registry.listReports(options)).map((entry) => entry.id);
+  expect(await ids()).toEqual(["claude:max"]);
+  now = 299_999;
+  expect(await ids()).toEqual(["claude:max"]);
+  expect(discoveries).toEqual(["global", "/max", "global"]);
+  expect(fetches).toBe(1);
+  now = 300_000;
+  await ids();
+  expect(discoveries.slice(3)).toEqual(["global", "/max"]);
+  await ids({ forceRefresh: true });
+  expect(discoveries.slice(5)).toEqual(["global", "/max"]);
+  launches.push({ provider: "claude", env: { CLAUDE_CONFIG_DIR: "/other" } });
+  await ids();
+  expect(discoveries.slice(7).sort()).toEqual(["/max", "/other", "global"]);
+});
+
 test("reports arrive independently and a hung fetch settles as an error before completion", async () => {
   const registry = new UsageSourceRegistry(Date.now, 300_000, undefined, undefined, 25);
   let finishSlow!: (value: unknown) => void;

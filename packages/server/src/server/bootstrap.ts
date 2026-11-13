@@ -693,6 +693,7 @@ export async function createPaseoDaemon(
       hasAgent: (id) => agentManager.getAgent(id) !== null,
       usageSession: (id) => agentManager.usageSession(id),
       resolveLaunch: (provider) => providerSnapshotManager.resolveUsageLaunch(provider),
+      usageLaunches: () => providerSnapshotManager.listUsageLaunches(),
     },
     managedSources: new ManagedPluginSources(config.paseoHome, {
       registries: config.pluginRegistries,

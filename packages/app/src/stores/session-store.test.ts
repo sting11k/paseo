@@ -822,3 +822,118 @@ describe("removeWorkspace", () => {
     expect(after.workspaces).toBe(before.workspaces);
   });
 });
+
+describe("Laneworks related agent activity", () => {
+  function laneworksAgent(input: {
+    id: string;
+    role: string;
+    workspaceId: string;
+    parentAgentId?: string;
+  }): Agent {
+    return {
+      ...createTestAgent(input.id),
+      workspaceId: input.workspaceId,
+      parentAgentId: input.parentAgentId ?? null,
+      labels: { "laneworks.project": "proj-a", "laneworks.role": input.role },
+    };
+  }
+
+  function runningSince(agent: Agent, startedAt: string): Agent {
+    return {
+      ...agent,
+      status: "running",
+      turn: {
+        phase: "open",
+        turnId: `turn-${agent.id}`,
+        startedAt: new Date(startedAt),
+        cancellationRequestId: null,
+      },
+    };
+  }
+
+  function relatedActivity() {
+    return Object.fromEntries(getTestSessionReferences().session.relatedAgentActivity);
+  }
+
+  const supervisor = laneworksAgent({
+    id: "supervisor",
+    role: "supervisor",
+    workspaceId: "ws-supervisor",
+  });
+
+  it("follows a background seat's turn through agent directory updates", () => {
+    initializeTestSession();
+    const lead = laneworksAgent({ id: "lead", role: "lead", workspaceId: "ws-lead" });
+    useSessionStore.getState().setAgents(
+      "test-server",
+      new Map([
+        [supervisor.id, supervisor],
+        [lead.id, lead],
+      ]),
+    );
+    const idle = relatedActivity();
+
+    applyTestTurn("test-server", "lead", {
+      type: "stream_open",
+      turn: { turnId: "turn-lead", startedAt: new Date("2026-11-13T10:00:00.000Z") },
+    });
+    const started = relatedActivity();
+
+    applyTestTurn("test-server", "lead", { type: "stream_close", turnId: "turn-lead" });
+    const stopped = relatedActivity();
+
+    expect([idle, started, stopped]).toEqual([
+      {},
+      {
+        "ws-supervisor": {
+          status: "running",
+          enteredAt: new Date("2026-11-13T10:00:00.000Z"),
+        },
+      },
+      {},
+    ]);
+  });
+
+  it("rebuilds from the snapshot after a reconnect that replaced the Lead", () => {
+    initializeTestSession();
+    const oldLead = laneworksAgent({ id: "old-lead", role: "lead", workspaceId: "ws-old-lead" });
+    const newLead = laneworksAgent({
+      id: "new-lead",
+      role: "lead",
+      workspaceId: "ws-new-lead",
+      parentAgentId: "old-lead",
+    });
+    useSessionStore.getState().setAgents(
+      "test-server",
+      new Map([
+        [supervisor.id, supervisor],
+        [oldLead.id, runningSince(oldLead, "2026-11-13T09:00:00.000Z")],
+      ]),
+    );
+    const beforeDisconnect = relatedActivity();
+
+    // The reconnect snapshot no longer lists the archived Lead; its replacement is running.
+    useSessionStore.getState().setAgents(
+      "test-server",
+      new Map([
+        [supervisor.id, supervisor],
+        [newLead.id, runningSince(newLead, "2026-11-13T10:00:00.000Z")],
+      ]),
+    );
+    const afterReconnect = relatedActivity();
+
+    useSessionStore.getState().setAgents(
+      "test-server",
+      new Map([
+        [supervisor.id, supervisor],
+        [newLead.id, newLead],
+      ]),
+    );
+
+    expect([beforeDisconnect, afterReconnect, relatedActivity()]).toEqual([
+      { "ws-supervisor": { status: "running", enteredAt: new Date("2026-11-13T09:00:00.000Z") } },
+      { "ws-supervisor": { status: "running", enteredAt: new Date("2026-11-13T10:00:00.000Z") } },
+      {},
+    ]);
+  });
+});

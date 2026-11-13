@@ -13,6 +13,7 @@ import { projectDisplayNameFromProjectId } from "@/utils/project-display-name";
 import { aggregateSidebarStateBuckets } from "@/utils/sidebar-agent-state";
 import { shortenPath } from "@/utils/shorten-path";
 import type { WorkspaceAgentActivity } from "@/utils/workspace-agent-activity";
+import type { RelatedAgentActivity } from "@/workspace-status/laneworks-related-activity";
 import { resolveWorkspaceMapKeyByIdentity } from "@/utils/workspace-identity";
 
 const EMPTY_PROJECTS: SidebarProjectEntry[] = [];
@@ -76,11 +77,13 @@ export interface SidebarWorkspaceSession {
   serverId: string;
   workspaces: Map<string, WorkspaceDescriptor>;
   workspaceAgentActivity: Map<string, WorkspaceAgentActivity>;
+  relatedAgentActivity: Map<string, RelatedAgentActivity>;
 }
 
 interface SidebarWorkspaceSessionSource {
   workspaces: Map<string, WorkspaceDescriptor>;
   workspaceAgentActivity: Map<string, WorkspaceAgentActivity>;
+  relatedAgentActivity: Map<string, RelatedAgentActivity>;
 }
 
 export function selectSidebarWorkspaceSessions(
@@ -97,6 +100,7 @@ export function selectSidebarWorkspaceSessions(
       serverId,
       workspaces: session.workspaces,
       workspaceAgentActivity: session.workspaceAgentActivity,
+      relatedAgentActivity: session.relatedAgentActivity,
     });
   }
   return selected;
@@ -117,7 +121,8 @@ export function areSidebarWorkspaceSessionsEqual(
       !rightSession ||
       leftSession.serverId !== rightSession.serverId ||
       leftSession.workspaces !== rightSession.workspaces ||
-      leftSession.workspaceAgentActivity !== rightSession.workspaceAgentActivity
+      leftSession.workspaceAgentActivity !== rightSession.workspaceAgentActivity ||
+      leftSession.relatedAgentActivity !== rightSession.relatedAgentActivity
     ) {
       return false;
     }
@@ -147,6 +152,7 @@ export function createSidebarWorkspaceEntry(input: {
   projectViewKey?: string;
   pendingCreateAttempts?: Record<string, PendingCreateAttempt>;
   workspaceAgentActivity?: ReadonlyMap<string, WorkspaceAgentActivity>;
+  relatedAgentActivity?: ReadonlyMap<string, RelatedAgentActivity>;
 }): SidebarWorkspaceEntry {
   const projectViewKey = input.projectViewKey ?? input.workspace.projectId;
   const effectiveStatus = deriveEffectiveWorkspaceStatus(input);
@@ -188,6 +194,7 @@ const EMPTY_WORKSPACE_LABELS: string[] = [];
 export interface ProjectStatusSession {
   workspaces: Map<string, WorkspaceDescriptor>;
   workspaceAgentActivity: Map<string, WorkspaceAgentActivity>;
+  relatedAgentActivity: Map<string, RelatedAgentActivity>;
 }
 
 /**
@@ -231,6 +238,7 @@ export function deriveProjectStatusBucket(input: {
           workspace,
           pendingCreateAttempts: input.pendingCreateAttempts,
           workspaceAgentActivity: session.workspaceAgentActivity,
+          relatedAgentActivity: session.relatedAgentActivity,
         }).status,
       );
     }
@@ -375,6 +383,7 @@ export function buildSidebarWorkspaceEntries(input: {
       projectViewKey: placement.projectViewKey,
       pendingCreateAttempts: input.pendingCreateAttempts,
       workspaceAgentActivity: session.workspaceAgentActivity,
+      relatedAgentActivity: session.relatedAgentActivity,
     });
     const previousEntry = input.previousEntries?.get(placement.workspaceKey);
     const nextEntry =

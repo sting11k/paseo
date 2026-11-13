@@ -3,18 +3,34 @@ import { useCreateFlowStore, type PendingCreateAttempt } from "@/stores/create-f
 import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-store";
 import type { WorkspaceAgentActivity } from "@/utils/workspace-agent-activity";
 import { resolveWorkspaceMapKeyByIdentity } from "@/utils/workspace-identity";
+import {
+  applyRelatedAgentActivity,
+  type RelatedAgentActivity,
+} from "@/workspace-status/laneworks-related-activity";
 
 interface EffectiveWorkspaceStatus {
   status: WorkspaceDescriptor["status"];
   enteredAt: Date | null;
 }
 
-export function deriveEffectiveWorkspaceStatus(input: {
+interface EffectiveWorkspaceStatusInput {
   serverId: string;
   workspace: WorkspaceDescriptor;
   pendingCreateAttempts?: Record<string, PendingCreateAttempt>;
   workspaceAgentActivity?: ReadonlyMap<string, WorkspaceAgentActivity>;
-}): EffectiveWorkspaceStatus {
+  relatedAgentActivity?: ReadonlyMap<string, RelatedAgentActivity>;
+}
+
+export function deriveEffectiveWorkspaceStatus(
+  input: EffectiveWorkspaceStatusInput,
+): EffectiveWorkspaceStatus {
+  return applyRelatedAgentActivity(
+    deriveOwnWorkspaceStatus(input),
+    input.relatedAgentActivity?.get(input.workspace.id),
+  );
+}
+
+function deriveOwnWorkspaceStatus(input: EffectiveWorkspaceStatusInput): EffectiveWorkspaceStatus {
   if (input.workspace.status !== "done") {
     return { status: input.workspace.status, enteredAt: input.workspace.statusEnteredAt };
   }
@@ -68,6 +84,7 @@ export function useWorkspaceStatus(serverId: string, workspaceId: string) {
         workspace,
         pendingCreateAttempts,
         workspaceAgentActivity: session.workspaceAgentActivity,
+        relatedAgentActivity: session.relatedAgentActivity,
       }).status;
     }),
   );
